@@ -12,6 +12,8 @@ dependencies = [
     "huggingface-hub>=1.23.0",
     "matplotlib>=3.11.0",
     "requests>=2.34.2",
+    "rich>=15.0.0",
+    "tqdm>=4.68.4",
 ]
 
 [project.scripts]

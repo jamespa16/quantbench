@@ -6,9 +6,12 @@ import argparse
 import sys
 from pathlib import Path
 
+from rich.console import Console
+
 from quantbench.discovery import discover_quants
 from quantbench.orchestrator import run_pipeline
 from quantbench.report import write_chart, write_csv
+from quantbench.ui import create_display, print_banner
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -48,6 +51,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
+    console = Console()
+    print_banner(console, subtitle="benchmark GGUF quantizations on HumanEval+")
+
     print(f"discovering quants in {args.repo_id}...")
     quants = discover_quants(args.repo_id)
     if not quants:
@@ -73,17 +79,19 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = Path(args.output_dir) if args.output_dir else Path("results") / repo_slug
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    outcomes = run_pipeline(
-        args.repo_id,
-        quants,
-        output_dir,
-        cache_dir=args.cache_dir,
-        llama_server_bin=args.llama_server_bin,
-        gpu_layers=args.gpu_layers,
-        ctx_size=args.ctx_size,
-        limit=args.limit,
-        keep_downloads=args.keep_downloads,
-    )
+    with create_display(console) as display:
+        outcomes = run_pipeline(
+            args.repo_id,
+            quants,
+            output_dir,
+            display,
+            cache_dir=args.cache_dir,
+            llama_server_bin=args.llama_server_bin,
+            gpu_layers=args.gpu_layers,
+            ctx_size=args.ctx_size,
+            limit=args.limit,
+            keep_downloads=args.keep_downloads,
+        )
 
     write_csv(outcomes, output_dir / "results.csv")
     write_chart(outcomes, output_dir / "results.png", repo_id=args.repo_id)

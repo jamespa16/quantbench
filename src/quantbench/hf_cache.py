@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from huggingface_hub import scan_cache_dir, snapshot_download, try_to_load_from_cache
+from tqdm import tqdm
 
 from quantbench.discovery import Quant
 
@@ -42,9 +43,16 @@ def was_cached(repo_id: str, quant: Quant, *, cache_dir: str | None = None) -> b
 
 
 def download_quant(
-    repo_id: str, quant: Quant, *, cache_dir: str | None = None, pre_existing: bool
+    repo_id: str,
+    quant: Quant,
+    *,
+    cache_dir: str | None = None,
+    pre_existing: bool,
+    tqdm_class: type[tqdm] | None = None,
 ) -> DownloadedQuant:
-    snapshot_dir = snapshot_download(repo_id, allow_patterns=list(quant.files), cache_dir=cache_dir)
+    snapshot_dir = snapshot_download(
+        repo_id, allow_patterns=list(quant.files), cache_dir=cache_dir, tqdm_class=tqdm_class
+    )
     return DownloadedQuant(
         quant=quant,
         model_path=os.path.join(snapshot_dir, quant.primary_file),

@@ -48,6 +48,16 @@ def _match_quant_token(filename: str) -> str | None:
     return f"{prefix or ''}{token}"
 
 
+def fetch_file_sizes(repo_id: str) -> dict[str, int]:
+    """Repo-relative path -> size in bytes, for every file in the repo.
+
+    Used to show a real download percentage instead of an indeterminate
+    spinner (`snapshot_download` itself doesn't expose the total upfront).
+    """
+    info = HfApi().repo_info(repo_id, files_metadata=True)
+    return {s.rfilename: s.size for s in info.siblings if s.size is not None}
+
+
 def discover_quants(repo_id: str) -> list[Quant]:
     """List a repo's GGUF files and group them into quants.
 

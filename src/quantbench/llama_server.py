@@ -18,6 +18,13 @@ class LlamaServerError(RuntimeError):
     """Raised when llama-server fails to start, become healthy, or generate."""
 
 
+@dataclass(frozen=True)
+class GenerateResult:
+    text: str
+    completion_tokens: int
+    elapsed_s: float
+
+
 def _free_port() -> int:
     with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("127.0.0.1", 0))
@@ -104,20 +111,27 @@ class LlamaServer:
         system: str | None = None,
         max_tokens: int = 1024,
         temperature: float = 0.0,
-    ) -> str:
+    ) -> GenerateResult:
         """POST a chat completion; the server applies the GGUF's chat template."""
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        start = time.monotonic()
         resp = requests.post(
             f"{self.base_url}/v1/chat/completions",
             json={"messages": messages, "temperature": temperature, "max_tokens": max_tokens},
             timeout=self.request_timeout,
         )
+        elapsed_s = time.monotonic() - start
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        body = resp.json()
+        return GenerateResult(
+            text=body["choices"][0]["message"]["content"],
+            completion_tokens=body["usage"]["completion_tokens"],
+            elapsed_s=elapsed_s,
+        )
 
     def stop(self, *, timeout: float = 15.0) -> None:
         if self._process is not None and self._process.poll() is None:

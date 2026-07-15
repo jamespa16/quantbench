@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,17 +43,25 @@ class EvalResult:
     n_problems: int
 
 
-def run_humaneval_plus(server: LlamaServer, output_dir: Path, *, limit: int | None = None) -> EvalResult:
+def run_humaneval_plus(
+    server: LlamaServer,
+    output_dir: Path,
+    *,
+    limit: int | None = None,
+    on_problem_done: Callable[[int, int, int, float], None] | None = None,
+) -> EvalResult:
     output_dir.mkdir(parents=True, exist_ok=True)
     problems = get_human_eval_plus()
     all_task_ids = list(problems)
     tested_task_ids = all_task_ids[:limit] if limit else all_task_ids
     skipped_task_ids = all_task_ids[limit:] if limit else []
 
-    samples = [
-        {"task_id": task_id, "solution": server.generate(problems[task_id]["prompt"], system=_SYSTEM_PROMPT)}
-        for task_id in tested_task_ids
-    ]
+    samples = []
+    for i, task_id in enumerate(tested_task_ids, start=1):
+        result = server.generate(problems[task_id]["prompt"], system=_SYSTEM_PROMPT)
+        samples.append({"task_id": task_id, "solution": result.text})
+        if on_problem_done:
+            on_problem_done(i, len(tested_task_ids), result.completion_tokens, result.elapsed_s)
     samples += [
         {"task_id": task_id, "solution": problems[task_id]["prompt"] + _STUB_SUFFIX}
         for task_id in skipped_task_ids
