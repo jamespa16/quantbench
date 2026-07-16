@@ -24,6 +24,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--quants", help="Comma-separated subset of quant names to run (default: all discovered)"
     )
     parser.add_argument(
+        "--quants-except", help="Comma-separated quant names to exclude (default: none)"
+    )
+    parser.add_argument(
         "--list-quants",
         action="store_true",
         help="Print discovered quants and exit without downloading anything",
@@ -54,6 +57,10 @@ def main(argv: list[str] | None = None) -> int:
     console = Console()
     print_banner(console, subtitle="benchmark GGUF quantizations on HumanEval+")
 
+    if args.quants and args.quants_except:
+        print("error: --quants and --quants-except are mutually exclusive", file=sys.stderr)
+        return 1
+
     print(f"discovering quants in {args.repo_id}...")
     quants = discover_quants(args.repo_id)
     if not quants:
@@ -69,6 +76,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"available: {', '.join(q.name for q in quants)}", file=sys.stderr)
             return 1
         quants = selected
+    elif args.quants_except:
+        excluded = {name.strip() for name in args.quants_except.split(",")}
+        known = {q.name for q in quants}
+        missing = excluded - known
+        if missing:
+            print(f"error: unknown quant(s): {', '.join(sorted(missing))}", file=sys.stderr)
+            print(f"available: {', '.join(q.name for q in quants)}", file=sys.stderr)
+            return 1
+        quants = [q for q in quants if q.name not in excluded]
 
     if args.list_quants:
         for q in quants:

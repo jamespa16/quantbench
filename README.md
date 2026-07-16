@@ -34,6 +34,9 @@ uv run quantbench unsloth/Qwen3.5-0.8B-GGUF --list-quants
 # quick smoke test: one quant, 5 problems
 uv run quantbench unsloth/Qwen3.5-0.8B-GGUF --quants Q4_K_M --limit 5
 
+# full run across every discovered quant, skipping a couple
+uv run quantbench unsloth/Qwen3.5-0.8B-GGUF --quants-except Q2_K,IQ1_S
+
 # full run across every discovered quant
 uv run quantbench unsloth/Qwen3.5-0.8B-GGUF
 ```
@@ -48,6 +51,7 @@ sanitized samples, evalplus results, and `llama-server` log.
 | Flag | Default | What it does |
 |---|---|---|
 | `--quants` | all discovered | Comma-separated subset of quant names to run |
+| `--quants-except` | none | Comma-separated quant names to exclude |
 | `--list-quants` | | Print discovered quants and exit |
 | `--limit N` | all 164 | Only run the first N HumanEval+ problems |
 | `--ctx-size` | model's own | `llama-server --ctx-size` override |
