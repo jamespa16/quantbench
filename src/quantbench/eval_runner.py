@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 from collections.abc import Callable
@@ -37,10 +38,31 @@ if platform.system() == "Darwin":
 
 
 @dataclass(frozen=True)
+class PassAtKStats:
+    mean: float
+    std_dev: float
+    std_error: float
+
+
+@dataclass(frozen=True)
 class EvalResult:
     base_pass1: float
     extra_pass1: float
     n_problems: int
+    pass_at_k: dict[int, float] | None = None
+    pass_at_k_stats: dict[int, PassAtKStats] | None = None
+    pass_at_k_per_task: dict[int, list[float]] | None = None
+
+
+def _pass_at_k(n: int, c: int, k: int) -> float:
+    """Compute pass@k: probability at least 1 of k random samples is correct.
+
+    Uses the formula from Chen et al. (2021): 1 - (n-c choose k) / (n choose k).
+    """
+    if n - c >= k:
+        return 1.0 - math.comb(n - c, k) / math.comb(n, k)
+    else:
+        return 1.0
 
 
 def run_humaneval_plus(
@@ -48,6 +70,8 @@ def run_humaneval_plus(
     output_dir: Path,
     *,
     limit: int | None = None,
+    n_samples: int = 1,
+    pass_at_k: list[int] | None = None,
     on_problem_done: Callable[[int, int, int, float], None] | None = None,
 ) -> EvalResult:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -58,10 +82,15 @@ def run_humaneval_plus(
 
     samples = []
     for i, task_id in enumerate(tested_task_ids, start=1):
-        result = server.generate(problems[task_id]["prompt"], system=_SYSTEM_PROMPT)
-        samples.append({"task_id": task_id, "solution": result.text})
+        task_total_tokens = 0
+        task_total_time = 0.0
+        for s in range(n_samples):
+            result = server.generate(problems[task_id]["prompt"], system=_SYSTEM_PROMPT)
+            samples.append({"task_id": task_id, "solution": result.text})
+            task_total_tokens += result.completion_tokens
+            task_total_time += result.elapsed_s
         if on_problem_done:
-            on_problem_done(i, len(tested_task_ids), result.completion_tokens, result.elapsed_s)
+            on_problem_done(i, len(tested_task_ids), task_total_tokens, task_total_time)
     samples += [
         {"task_id": task_id, "solution": problems[task_id]["prompt"] + _STUB_SUFFIX}
         for task_id in skipped_task_ids
@@ -79,20 +108,58 @@ def run_humaneval_plus(
     with open(results_path) as f:
         results = json.load(f)["eval"]
 
-    total = 0
-    base_correct = 0
-    extra_correct = 0
+    # Count correct samples per task (extra/tests+ suite for pass@k).
+    task_extra_correct: dict[str, int] = {}
+    task_base_correct: dict[str, int] = {}
+    task_n_samples: dict[str, int] = {}
+    total_tasks = 0
     for task_id in tested_task_ids:
         if task_id not in results:
             continue  # sanitize found no syntactically valid code for this task
-        run = results[task_id][0]
-        total += 1
-        base_ok = run["base_status"] == PASS
-        base_correct += base_ok
-        extra_correct += base_ok and run["plus_status"] == PASS
+        total_tasks += 1
+        entries = results[task_id]
+        task_n_samples[task_id] = len(entries)
+        task_extra_correct[task_id] = sum(
+            1 for e in entries if e["base_status"] == PASS and e["plus_status"] == PASS
+        )
+        task_base_correct[task_id] = sum(
+            1 for e in entries if e["base_status"] == PASS
+        )
+
+    base_pass1 = sum(task_base_correct.values()) / (total_tasks * n_samples) if total_tasks else 0.0
+    extra_pass1 = sum(task_extra_correct.values()) / (total_tasks * n_samples) if total_tasks else 0.0
+
+    # Compute pass@k (extra/tests+ suite) with per-task scores + stats.
+    pass_at_k_map: dict[int, float] | None = None
+    pass_at_k_stats_map: dict[int, PassAtKStats] | None = None
+    pass_at_k_per_task_map: dict[int, list[float]] | None = None
+    if pass_at_k:
+        pass_at_k_map = {}
+        pass_at_k_stats_map = {}
+        pass_at_k_per_task_map = {}
+        for k in pass_at_k:
+            per_task: list[float] = []
+            for task_id in task_extra_correct:
+                n = task_n_samples[task_id]
+                c = task_extra_correct[task_id]
+                per_task.append(_pass_at_k(n, c, k))
+            pass_at_k_per_task_map[k] = per_task
+            mean_val = sum(per_task) / len(per_task) if per_task else 0.0
+            n_tasks = len(per_task)
+            if n_tasks >= 2:
+                variance = sum((s - mean_val) ** 2 for s in per_task) / (n_tasks - 1)
+                std_dev = math.sqrt(variance)
+            else:
+                std_dev = 0.0
+            std_error = std_dev / math.sqrt(n_tasks) if n_tasks else 0.0
+            pass_at_k_map[k] = mean_val
+            pass_at_k_stats_map[k] = PassAtKStats(mean=mean_val, std_dev=std_dev, std_error=std_error)
 
     return EvalResult(
-        base_pass1=base_correct / total if total else 0.0,
-        extra_pass1=extra_correct / total if total else 0.0,
-        n_problems=total,
+        base_pass1=base_pass1,
+        extra_pass1=extra_pass1,
+        n_problems=total_tasks,
+        pass_at_k=pass_at_k_map,
+        pass_at_k_stats=pass_at_k_stats_map,
+        pass_at_k_per_task=pass_at_k_per_task_map,
     )

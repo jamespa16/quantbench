@@ -46,6 +46,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Where to write per-quant logs/samples and the final report (default: ./results/<repo_slug>)",
     )
     parser.add_argument(
+        "--n-samples", type=int, default=1, help="Number of completions to generate per problem (default: 1)"
+    )
+    parser.add_argument(
+        "--pass-at-k",
+        default=None,
+        help="Comma-separated k values for pass@k reporting, e.g. 1,10,100 (default: 1)",
+    )
+    parser.add_argument(
         "--keep-downloads", action="store_true", help="Don't delete quants that this run downloaded"
     )
     return parser.parse_args(argv)
@@ -60,6 +68,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.quants and args.quants_except:
         print("error: --quants and --quants-except are mutually exclusive", file=sys.stderr)
         return 1
+
+    if args.n_samples < 1:
+        print("error: --n-samples must be >= 1", file=sys.stderr)
+        return 1
+
+    pass_at_k: list[int] | None = None
+    if args.pass_at_k:
+        try:
+            pass_at_k = [int(x.strip()) for x in args.pass_at_k.split(",")]
+        except ValueError:
+            print("error: --pass-at-k must be comma-separated integers", file=sys.stderr)
+            return 1
+        if any(k < 1 for k in pass_at_k):
+            print("error: --pass-at-k values must be >= 1", file=sys.stderr)
+            return 1
+        for k in pass_at_k:
+            if k > args.n_samples:
+                print(f"error: pass@k={k} requires --n-samples >= {k} (got {args.n_samples})", file=sys.stderr)
+                return 1
 
     print(f"discovering quants in {args.repo_id}...")
     quants = discover_quants(args.repo_id)
@@ -106,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
             gpu_layers=args.gpu_layers,
             ctx_size=args.ctx_size,
             limit=args.limit,
+            n_samples=args.n_samples,
+            pass_at_k=pass_at_k,
             keep_downloads=args.keep_downloads,
         )
 

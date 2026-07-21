@@ -39,6 +39,8 @@ def run_pipeline(
     gpu_layers: str = "all",
     ctx_size: int | None = None,
     limit: int | None = None,
+    n_samples: int = 1,
+    pass_at_k: list[int] | None = None,
     keep_downloads: bool = False,
 ) -> list[QuantOutcome]:
     """Benchmark each quant in order, downloading quant N+1 while quant N is tested.
@@ -117,12 +119,24 @@ def run_pipeline(
             with server:
                 display.start_eval(downloaded.quant.name)
                 result = run_humaneval_plus(
-                    server, quant_dir, limit=limit, on_problem_done=display.on_problem_done
+                    server, quant_dir,
+                    limit=limit,
+                    n_samples=n_samples,
+                    pass_at_k=pass_at_k,
+                    on_problem_done=display.on_problem_done,
                 )
-            display.log(
-                f"  {downloaded.quant.name}: pass@1={result.extra_pass1:.3f} "
+            pass1_str = (
+                f"pass@1={result.extra_pass1:.3f} "
                 f"(base {result.base_pass1:.3f}, n={result.n_problems})"
             )
+            passk_str = ""
+            if result.pass_at_k and result.pass_at_k_stats:
+                parts = []
+                for k in sorted(result.pass_at_k):
+                    st = result.pass_at_k_stats[k]
+                    parts.append(f"pass@{k}={st.mean:.3f} ±{st.std_error:.3f}")
+                passk_str = f" [{', '.join(parts)}]"
+            display.log(f"  {downloaded.quant.name}: {pass1_str}{passk_str}")
             outcomes.append(QuantOutcome(downloaded.quant.name, size_bytes, result))
         except Exception as e:
             display.log(f"error: failed to benchmark {downloaded.quant.name}: {e}")
