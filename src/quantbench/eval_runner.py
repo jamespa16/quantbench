@@ -71,6 +71,7 @@ def run_humaneval_plus(
     *,
     limit: int | None = None,
     n_samples: int = 1,
+    temperature: float = 0.0,
     pass_at_k: list[int] | None = None,
     on_problem_done: Callable[[int, int, int, float], None] | None = None,
 ) -> EvalResult:
@@ -85,7 +86,7 @@ def run_humaneval_plus(
         task_total_tokens = 0
         task_total_time = 0.0
         for s in range(n_samples):
-            result = server.generate(problems[task_id]["prompt"], system=_SYSTEM_PROMPT)
+            result = server.generate(problems[task_id]["prompt"], system=_SYSTEM_PROMPT, temperature=temperature)
             samples.append({"task_id": task_id, "solution": result.text})
             task_total_tokens += result.completion_tokens
             task_total_time += result.elapsed_s

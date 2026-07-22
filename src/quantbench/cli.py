@@ -49,6 +49,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--n-samples", type=int, default=1, help="Number of completions to generate per problem (default: 1)"
     )
     parser.add_argument(
+        "--temperature", type=float, default=0.0, help="Sampling temperature (default: 0.0 for greedy)"
+    )
+    parser.add_argument(
         "--pass-at-k",
         default=None,
         help="Comma-separated k values for pass@k reporting, e.g. 1,10,100 (default: 1)",
@@ -134,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             ctx_size=args.ctx_size,
             limit=args.limit,
             n_samples=args.n_samples,
+            temperature=args.temperature,
             pass_at_k=pass_at_k,
             keep_downloads=args.keep_downloads,
         )

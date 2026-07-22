@@ -14,6 +14,7 @@ from rich.console import Group as _Group
 from rich.live import Live
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskID, TextColumn
 from rich.progress import DownloadColumn, TransferSpeedColumn
+from rich.text import Text
 
 # --- splash ------------------------------------------------------------
 
@@ -130,8 +131,16 @@ class _RichDisplay:
             "tok/s", total=None, readout="-- tok/s", start=False, visible=False
         )
 
+        # Log panel rendered inside Live so it doesn't corrupt the terminal.
+        self._log_lines: list[str] = []
+        self._log_panel = Progress(
+            TextColumn("{task.fields[msg]}"),
+            console=console,
+        )
+        self._log_task = self._log_panel.add_task("", msg=Text("waiting to start..."), start=False)
+
         self._live = Live(
-            _Group(self._quants_progress, self._download_progress, self._eval_progress),
+            _Group(self._quants_progress, self._download_progress, self._eval_progress, self._log_panel),
             console=console,
             refresh_per_second=10,
         )
@@ -144,7 +153,10 @@ class _RichDisplay:
         self._live.stop()
 
     def log(self, message: str) -> None:
-        self._console.print(message)
+        self._log_lines.append(message)
+        # Keep last 5 lines in the panel; show the most recent one.
+        display = "\n".join(self._log_lines[-5:])
+        self._log_panel.update(self._log_task, msg=Text(display, style="dim"), description="")
 
     def start_quant(self, name: str, index: int, total: int) -> None:
         self._quants_progress.update(

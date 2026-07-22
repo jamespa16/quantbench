@@ -43,7 +43,6 @@ class LlamaServer:
 
     model_path: str
     binary: str = "llama-server"
-    gpu_layers: str = "all"
     ctx_size: int | None = None
     host: str = "127.0.0.1"
     port: int = field(default_factory=_free_port)
@@ -52,6 +51,7 @@ class LlamaServer:
     request_timeout: float = 600.0
     _process: subprocess.Popen | None = field(default=None, init=False, repr=False)
     _log_file: object = field(default=None, init=False, repr=False)
+    gpu_layers: str | None = None
 
     @property
     def base_url(self) -> str:
@@ -69,8 +69,9 @@ class LlamaServer:
             "-m", self.model_path,
             "--host", self.host,
             "--port", str(self.port),
-            "-ngl", str(self.gpu_layers),
         ]
+        if self.gpu_layers is not None:
+            cmd += ["-ngl", str(self.gpu_layers)]
         if self.ctx_size is not None:
             cmd += ["--ctx-size", str(self.ctx_size)]
 
@@ -109,7 +110,7 @@ class LlamaServer:
         prompt: str,
         *,
         system: str | None = None,
-        max_tokens: int = 1024,
+        max_tokens: int = 32000,
         temperature: float = 0.0,
     ) -> GenerateResult:
         """POST a chat completion; the server applies the GGUF's chat template."""

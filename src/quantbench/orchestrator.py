@@ -40,6 +40,7 @@ def run_pipeline(
     ctx_size: int | None = None,
     limit: int | None = None,
     n_samples: int = 1,
+    temperature: float = 0.0,
     pass_at_k: list[int] | None = None,
     keep_downloads: bool = False,
 ) -> list[QuantOutcome]:
@@ -122,6 +123,7 @@ def run_pipeline(
                     server, quant_dir,
                     limit=limit,
                     n_samples=n_samples,
+                    temperature=temperature,
                     pass_at_k=pass_at_k,
                     on_problem_done=display.on_problem_done,
                 )
