@@ -3,15 +3,82 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from rich.console import Console
 
 from quantbench.discovery import discover_quants
-from quantbench.orchestrator import run_pipeline
+from quantbench.eval_runner import EvalResult, PassAtKStats
+from quantbench.orchestrator import QuantOutcome, run_pipeline
 from quantbench.report import write_chart, write_csv
 from quantbench.ui import create_display, print_banner
+
+
+def _load_outcome_from_summary(path: Path, *, run_key: str | None = None) -> QuantOutcome | None:
+    try:
+        data = json.loads((path / "summary.json").read_text())
+    except Exception:
+        return None
+    # Skip stale summaries: if the caller provides a run key and the cached
+    # one doesn't match, the benchmark parameters changed and the result is invalid.
+    if run_key is not None and data.get("run_key") != run_key:
+        return None
+    quant_name = data.get("quant_name")
+    size_bytes = data.get("size_bytes", 0)
+    error = data.get("error")
+    res_data = data.get("result")
+    result = None
+    if res_data:
+        pass_at_k_stats = None
+        if res_data.get("pass_at_k_stats"):
+            pass_at_k_stats = {
+                int(k): PassAtKStats(
+                    mean=v["mean"],
+                    std_dev=v["std_dev"],
+                    std_error=v["std_error"],
+                )
+                for k, v in res_data["pass_at_k_stats"].items()
+            }
+        # pass_at_k may be dict with string keys from json
+        pass_at_k = None
+        if res_data.get("pass_at_k"):
+            pass_at_k = {int(k): v for k, v in res_data["pass_at_k"].items()}
+        # pass_at_k_per_task: {k: [per-task scores]}, keys are strings from json
+        pass_at_k_per_task = None
+        raw_per_task = res_data.get("pass_at_k_per_task")
+        if raw_per_task:
+            pass_at_k_per_task = {int(k): v for k, v in raw_per_task.items()}
+        result = EvalResult(
+            base_pass1=res_data["base_pass1"],
+            extra_pass1=res_data["extra_pass1"],
+            n_problems=res_data["n_problems"],
+            pass_at_k=pass_at_k,
+            pass_at_k_stats=pass_at_k_stats,
+            pass_at_k_per_task=pass_at_k_per_task,
+        )
+    return QuantOutcome(quant_name, size_bytes, result, error)
+
+
+def _load_existing_outcomes(output_dir: Path, *, run_key: str | None = None) -> dict[str, QuantOutcome]:
+    outcomes: dict[str, QuantOutcome] = {}
+    if not output_dir.exists():
+        return outcomes
+    for quant_dir in output_dir.iterdir():
+        if not quant_dir.is_dir():
+            continue
+        summary_path = quant_dir / "summary.json"
+        if summary_path.exists():
+            outcome = _load_outcome_from_summary(quant_dir, run_key=run_key)
+            if outcome:
+                outcomes[outcome.quant_name] = outcome
+    return outcomes
+
+
+def _run_key(args: argparse.Namespace) -> str:
+    """Deterministic key from parameters that affect benchmark results."""
+    return f"{args.limit}:{args.n_samples}:{args.temperature}:{args.pass_at_k}:{args.ctx_size}"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -125,12 +192,22 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = Path(args.output_dir) if args.output_dir else Path("results") / repo_slug
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load any previously completed quants so we can resume
+    current_run_key = _run_key(args)
+    existing_outcomes = _load_existing_outcomes(output_dir, run_key=current_run_key)
+    existing_names = set(existing_outcomes.keys())
+    # Filter out quants already completed
+    remaining_quants = [q for q in quants if q.name not in existing_names]
+    if existing_names:
+        print(f"resuming: {len(existing_names)} quant(s) already completed, {len(remaining_quants)} remaining")
+
     with create_display(console) as display:
-        outcomes = run_pipeline(
+        new_outcomes = run_pipeline(
             args.repo_id,
-            quants,
+            remaining_quants,
             output_dir,
             display,
+            run_key=current_run_key,
             cache_dir=args.cache_dir,
             llama_server_bin=args.llama_server_bin,
             gpu_layers=args.gpu_layers,
@@ -142,11 +219,19 @@ def main(argv: list[str] | None = None) -> int:
             keep_downloads=args.keep_downloads,
         )
 
-    write_csv(outcomes, output_dir / "results.csv")
-    write_chart(outcomes, output_dir / "results.png", repo_id=args.repo_id)
+    # Merge existing and new outcomes, preserving order
+    all_outcomes = list(existing_outcomes.values()) + new_outcomes
+    # Ensure we have all quants in output (even those not yet run) for completeness
+    # Build a dict for quick lookup
+    outcome_map = {o.quant_name: o for o in all_outcomes}
+    # Preserve original quant order
+    ordered_outcomes = [outcome_map[q.name] for q in quants if q.name in outcome_map]
 
-    n_ok = sum(1 for o in outcomes if o.result is not None)
-    print(f"\ndone: {n_ok}/{len(outcomes)} quants benchmarked successfully")
+    write_csv(ordered_outcomes, output_dir / "results.csv")
+    write_chart(ordered_outcomes, output_dir / "results.png", repo_id=args.repo_id)
+
+    n_ok = sum(1 for o in ordered_outcomes if o.result is not None)
+    print(f"\ndone: {n_ok}/{len(ordered_outcomes)} quants benchmarked successfully")
     print(f"results: {output_dir / 'results.csv'}")
     print(f"chart:   {output_dir / 'results.png'}")
     return 0 if n_ok else 1
