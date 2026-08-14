@@ -17,7 +17,7 @@ from quantbench.eval_runner import PassAtKStats
 from quantbench.orchestrator import QuantOutcome
 
 # Single-hue categorical slot 1 + chart chrome from the project's validated
-# default palette (references/palette.md in the dataviz skill).
+# default palette.
 _INK = "#0b0b0b"
 _INK_SECONDARY = "#52514e"
 _INK_MUTED = "#898781"

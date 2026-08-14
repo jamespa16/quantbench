@@ -216,7 +216,7 @@ class TestRunKey:
     def test_default_values(self) -> None:
         args = _parse_args(["author/model"])
         key = _run_key(args)
-        assert key == "None:1:0.0:None:None"
+        assert key == "None:1:0.0:None:None:32000"
 
     def test_custom_values(self) -> None:
         args = _parse_args(
@@ -235,7 +235,7 @@ class TestRunKey:
             ]
         )
         key = _run_key(args)
-        assert key == "5:10:0.5:1,10:8192"
+        assert key == "5:10:0.5:1,10:8192:32000"
 
     def test_deterministic(self) -> None:
         """Same arguments produce the same key."""
@@ -284,7 +284,7 @@ class TestRunKey:
         args = _parse_args(["author/model"])
         key = _run_key(args)
         parts = key.split(":")
-        assert len(parts) == 5  # limit:n_samples:temperature:pass_at_k:ctx_size
+        assert len(parts) == 6  # limit:n_samples:temperature:pass_at_k:ctx_size:max_tokens
 
 
 # ---------------------------------------------------------------------------

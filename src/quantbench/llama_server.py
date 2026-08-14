@@ -28,6 +28,11 @@ class GenerateResult:
 
 
 def _free_port() -> int:
+    # NOTE: There is a brief race window between binding the socket (which
+    # reserves the port) and returning it. Another process could grab the
+    # same port if it starts before the caller actually binds to the
+    # returned value. In practice this only matters when multiple
+    # quantbench instances run concurrently on the same host.
     with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]

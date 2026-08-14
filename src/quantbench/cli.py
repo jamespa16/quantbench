@@ -79,7 +79,7 @@ def _load_existing_outcomes(output_dir: Path, *, run_key: str | None = None) -> 
 
 def _run_key(args: argparse.Namespace) -> str:
     """Deterministic key from parameters that affect benchmark results."""
-    return f"{args.limit}:{args.n_samples}:{args.temperature}:{args.pass_at_k}:{args.ctx_size}"
+    return f"{args.limit}:{args.n_samples}:{args.temperature}:{args.pass_at_k}:{args.ctx_size}:{args.max_tokens}"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -115,6 +115,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--n-samples", type=int, default=1, help="Number of completions to generate per problem (default: 1)"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=32000, help="Maximum tokens per generation (default: 32000)"
     )
     parser.add_argument(
         "--temperature", type=float, default=0.0, help="Sampling temperature (default: 0.0 for greedy)"
@@ -221,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
             temperature=args.temperature,
             pass_at_k=pass_at_k,
             keep_downloads=args.keep_downloads,
+            max_tokens=args.max_tokens,
         )
 
     # Merge existing and new outcomes, preserving order

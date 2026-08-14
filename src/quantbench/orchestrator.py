@@ -72,6 +72,7 @@ def run_pipeline(
     temperature: float = 0.0,
     pass_at_k: list[int] | None = None,
     keep_downloads: bool = False,
+    max_tokens: int = 32000,
 ) -> list[QuantOutcome]:
     """Benchmark each quant in order, downloading quant N+1 while quant N is tested.
 
@@ -159,6 +160,7 @@ def run_pipeline(
                     temperature=temperature,
                     pass_at_k=pass_at_k,
                     on_problem_done=display.on_problem_done,
+                    max_tokens=max_tokens,
                 )
             pass1_str = (
                 f"pass@1={result.extra_pass1:.3f} "

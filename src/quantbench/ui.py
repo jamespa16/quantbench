@@ -208,9 +208,6 @@ class _PlainDisplay:
     def __exit__(self, *exc_info: object) -> None:
         pass
 
-    def log(self, message: str) -> None:
-        self._console.print(message)
-
     def start_quant(self, name: str, index: int, total: int) -> None:
         self._console.print(f"[{index}/{total}] {name}")
 
@@ -250,6 +247,9 @@ class _PlainDisplay:
         if index == total or index % step == 0:
             tok_s = completion_tokens / elapsed_s if elapsed_s else 0.0
             self._console.print(f"  {index}/{total} problems ({tok_s:.1f} tok/s)")
+
+    def log(self, message: str) -> None:
+        self._console.print(message)
 
 
 BenchDisplay = _RichDisplay | _PlainDisplay

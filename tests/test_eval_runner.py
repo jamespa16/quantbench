@@ -151,7 +151,7 @@ class TestStubSuffix:
 
     def test_stub_suffix_content(self) -> None:
         """The stub suffix must be a valid Python raise statement."""
-        assert _STUB_SUFFIX == "    raise NotImplementedError\n"
+        assert _STUB_SUFFIX == "    # STUB: skipped by --limit\n    raise NotImplementedError\n"
 
     def test_stub_suffix_indented(self) -> None:
         """The stub suffix must be indented to work inside a function body."""

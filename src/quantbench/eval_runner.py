@@ -26,15 +26,8 @@ _SYSTEM_PROMPT = (
 # Syntactically valid but always-failing: pads out --limit-skipped tasks so
 # evalplus.evaluate()'s "every dataset problem must be present" assertion is
 # satisfied without actually spending generation time on them.
-_STUB_SUFFIX = "    raise NotImplementedError\n"
-
-if platform.system() == "Darwin":
-    # macOS's setrlimit(RLIMIT_AS, ...) can't actually lower the address-space
-    # limit (fails with "current limit exceeds maximum limit" regardless of
-    # the requested value), which crashes every sandboxed test execution
-    # inside evalplus.eval.utils.reliability_guard. -1 disables that guard's
-    # memory cap; unaffected on Linux, where RLIMIT_AS works normally.
-    os.environ.setdefault("EVALPLUS_MAX_MEMORY_BYTES", "-1")
+# STUB: skipped by --limit
+_STUB_SUFFIX = "    # STUB: skipped by --limit\n    raise NotImplementedError\n"
 
 
 @dataclass(frozen=True)
@@ -74,7 +67,15 @@ def run_humaneval_plus(
     temperature: float = 0.0,
     pass_at_k: list[int] | None = None,
     on_problem_done: Callable[[int, int, int, float], None] | None = None,
+    max_tokens: int = 32000,
 ) -> EvalResult:
+    if platform.system() == "Darwin":
+        # macOS's setrlimit(RLIMIT_AS, ...) can't actually lower the address-space
+        # limit (fails with "current limit exceeds maximum limit" regardless of
+        # the requested value), which crashes every sandboxed test execution
+        # inside evalplus.eval.utils.reliability_guard. -1 disables that guard's
+        # memory cap; unaffected on Linux, where RLIMIT_AS works normally.
+        os.environ.setdefault("EVALPLUS_MAX_MEMORY_BYTES", "-1")
     output_dir.mkdir(parents=True, exist_ok=True)
     problems = get_human_eval_plus()
     all_task_ids = list(problems)
@@ -86,7 +87,12 @@ def run_humaneval_plus(
         task_total_tokens = 0
         task_total_time = 0.0
         for _s in range(n_samples):
-            result = server.generate(problems[task_id]["prompt"], system=_SYSTEM_PROMPT, temperature=temperature)
+            result = server.generate(
+                problems[task_id]["prompt"],
+                system=_SYSTEM_PROMPT,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
             samples.append({"task_id": task_id, "solution": result.text})
             task_total_tokens += result.completion_tokens
             task_total_time += result.elapsed_s
