@@ -7,14 +7,12 @@ themselves.
 
 from __future__ import annotations
 
-from tqdm import tqdm as _tqdm_base
-
 from rich.console import Console
 from rich.console import Group as _Group
 from rich.live import Live
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskID, TextColumn
-from rich.progress import DownloadColumn, TransferSpeedColumn
+from rich.progress import BarColumn, DownloadColumn, Progress, SpinnerColumn, TaskID, TextColumn, TransferSpeedColumn
 from rich.text import Text
+from tqdm import tqdm as _tqdm_base
 
 # --- splash ------------------------------------------------------------
 
@@ -145,7 +143,7 @@ class _RichDisplay:
             refresh_per_second=10,
         )
 
-    def __enter__(self) -> "_RichDisplay":
+    def __enter__(self) -> _RichDisplay:
         self._live.start()
         return self
 
@@ -204,7 +202,7 @@ class _PlainDisplay:
     def __init__(self, console: Console) -> None:
         self._console = console
 
-    def __enter__(self) -> "_PlainDisplay":
+    def __enter__(self) -> _PlainDisplay:
         return self
 
     def __exit__(self, *exc_info: object) -> None:

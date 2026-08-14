@@ -146,7 +146,7 @@ class LlamaServer:
             self._log_file.close()
             self._log_file = None
 
-    def __enter__(self) -> "LlamaServer":
+    def __enter__(self) -> LlamaServer:
         self.start()
         return self
 

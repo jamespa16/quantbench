@@ -78,10 +78,7 @@ def discover_quants(repo_id: str) -> list[Quant]:
 
     groups: dict[str, list[str]] = {}
     for path in files:
-        if "/" in path:
-            key = path.split("/", 1)[0]
-        else:
-            key = _match_quant_token(path.rsplit("/", 1)[-1])
+        key = path.split("/", 1)[0] if "/" in path else _match_quant_token(path.rsplit("/", 1)[-1])
         if key is None:
             print(f"warning: could not determine quant for {path!r}, skipping")
             continue

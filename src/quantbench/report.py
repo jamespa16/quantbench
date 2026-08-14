@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import math
 import textwrap
 from itertools import combinations
 from pathlib import Path
@@ -38,7 +37,7 @@ def _pairwise_p_values(
               and len(o.result.pass_at_k_per_task[k]) >= 2]
     p_map: dict[tuple[str, str], float] = {}
     for (a, scores_a), (b, scores_b) in combinations(scored, 2):
-        t_stat, p_val = stats.ttest_ind(scores_a, scores_b, equal_var=False)
+        _t_stat, p_val = stats.ttest_ind(scores_a, scores_b, equal_var=False)
         p_map[(a, b)] = p_val
     return p_map
 
@@ -181,7 +180,7 @@ def write_chart(outcomes: list[QuantOutcome], path: Path, *, repo_id: str) -> No
     ax.set_facecolor(_SURFACE)
 
     x_positions = range(len(names))
-    bars = ax.bar(
+    ax.bar(
         x_positions, values,
         yerr=stderrs if any(stderrs) else None,
         capsize=4,
@@ -212,7 +211,7 @@ def write_chart(outcomes: list[QuantOutcome], path: Path, *, repo_id: str) -> No
     ax.tick_params(axis="y", colors=_INK_MUTED, labelsize=9)
     plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
 
-    for i, (pos, value, stderr, marker) in enumerate(zip(x_positions, values, stderrs, sig_markers)):
+    for i, (pos, value, stderr, marker) in enumerate(zip(x_positions, values, stderrs, sig_markers, strict=False)):
         label_y = value + stderr + 0.02
         text_parts = [f"{value:.2f}"]
         if marker:

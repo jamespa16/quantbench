@@ -85,7 +85,7 @@ def run_humaneval_plus(
     for i, task_id in enumerate(tested_task_ids, start=1):
         task_total_tokens = 0
         task_total_time = 0.0
-        for s in range(n_samples):
+        for _s in range(n_samples):
             result = server.generate(problems[task_id]["prompt"], system=_SYSTEM_PROMPT, temperature=temperature)
             samples.append({"task_id": task_id, "solution": result.text})
             task_total_tokens += result.completion_tokens
