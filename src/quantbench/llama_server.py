@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import os
 import socket
 import subprocess
@@ -10,6 +11,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import requests
 
@@ -50,7 +52,7 @@ class LlamaServer:
     startup_timeout: float = 300.0
     request_timeout: float = 600.0
     _process: subprocess.Popen | None = field(default=None, init=False, repr=False)
-    _log_file: object = field(default=None, init=False, repr=False)
+    _log_file: io.TextIOWrapper | None = field(default=None, init=False, repr=False)
     gpu_layers: str | None = None
 
     @property
@@ -62,7 +64,7 @@ class LlamaServer:
             fd, self.log_path = tempfile.mkstemp(prefix="quantbench-llama-server-", suffix=".log")
             os.close(fd)
         Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
-        self._log_file = open(self.log_path, "w")
+        self._log_file = cast("io.TextIOWrapper", open(self.log_path, "w"))  # noqa: SIM115
 
         cmd = [
             self.binary,
@@ -86,8 +88,9 @@ class LlamaServer:
     def _wait_healthy(self) -> None:
         deadline = time.monotonic() + self.startup_timeout
         while time.monotonic() < deadline:
-            if self._process.poll() is not None:
-                code = self._process.returncode
+            process = self._process
+            if process is None or process.poll() is not None:
+                code = process.returncode if process is not None else None
                 self.stop()
                 raise LlamaServerError(
                     f"llama-server exited early (code {code}) while loading "

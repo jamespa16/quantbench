@@ -11,6 +11,7 @@ way to reclaim just the files this run downloaded.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections import Counter
 from dataclasses import dataclass
@@ -90,7 +91,5 @@ def cleanup_quant(downloaded: DownloadedQuant, *, cache_dir: str | None = None) 
             blob_path.unlink()
 
     for directory in touched_dirs:
-        try:
+        with contextlib.suppress(OSError):
             directory.rmdir()  # only succeeds if now empty (multi-shard subfolder)
-        except OSError:
-            pass

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, ModelInfo
 
 _SHARD_SUFFIX_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
 # Structural pattern instead of an enumerated whitelist: quant naming grows
@@ -55,7 +55,11 @@ def fetch_file_sizes(repo_id: str) -> dict[str, int]:
     spinner (`snapshot_download` itself doesn't expose the total upfront).
     """
     info = HfApi().repo_info(repo_id, files_metadata=True)
-    return {s.rfilename: s.size for s in info.siblings if s.size is not None}
+    assert isinstance(info, ModelInfo)
+    siblings = info.siblings
+    if siblings is None:
+        return {}
+    return {s.rfilename: s.size for s in siblings if s.size is not None}
 
 
 def discover_quants(repo_id: str) -> list[Quant]:
