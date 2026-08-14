@@ -1,7 +1,7 @@
 [project]
 name = "quantbench"
 version = "0.1.0"
-description = "Add your description here"
+description = "Benchmark every GGUF quantization in a Hugging Face repo against HumanEval+"
 readme = "README.md"
 authors = [
     { name = "James Palmer", email = "james.pa@outlook.com" }
@@ -17,9 +17,30 @@ dependencies = [
     "tqdm>=4.68.4",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.14.0",
+    "mypy>=1.14.0",
+    "ruff>=0.8.0",
+]
+
 [project.scripts]
 quantbench = "quantbench.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_unreachable = true
+ignore_missing_imports = true
+check_untyped_defs = false

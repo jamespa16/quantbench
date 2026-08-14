@@ -9,6 +9,7 @@ from pathlib import Path
 
 from rich.console import Console
 
+from quantbench import __version__
 from quantbench.discovery import discover_quants
 from quantbench.eval_runner import EvalResult, PassAtKStats
 from quantbench.orchestrator import QuantOutcome, run_pipeline
@@ -125,6 +126,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--keep-downloads", action="store_true", help="Don't delete quants that this run downloaded"
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
     )
     return parser.parse_args(argv)
 
