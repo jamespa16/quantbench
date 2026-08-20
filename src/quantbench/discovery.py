@@ -48,22 +48,15 @@ def _match_quant_token(filename: str) -> str | None:
     return f"{prefix or ''}{token}"
 
 
-def fetch_file_sizes(repo_id: str) -> dict[str, int]:
-    """Repo-relative path -> size in bytes, for every file in the repo.
-
-    Used to show a real download percentage instead of an indeterminate
-    spinner (`snapshot_download` itself doesn't expose the total upfront).
-    """
-    info = HfApi().repo_info(repo_id, files_metadata=True)
-    assert isinstance(info, ModelInfo)
-    siblings = info.siblings
-    if siblings is None:
-        return {}
-    return {s.rfilename: s.size for s in siblings if s.size is not None}
+def _is_gguf(path: str) -> bool:
+    # mmproj-*.gguf files are a multimodal vision projector shared across quants,
+    # not a quant of the LLM itself, and would otherwise merge into whichever
+    # group happens to share its precision suffix (e.g. mmproj-BF16 into BF16).
+    return path.lower().endswith(".gguf") and not path.rsplit("/", 1)[-1].lower().startswith("mmproj")
 
 
-def discover_quants(repo_id: str) -> list[Quant]:
-    """List a repo's GGUF files and group them into quants.
+def _group_files(files: list[str]) -> list[Quant]:
+    """Group repo-relative GGUF paths into quants.
 
     Grouping heuristic (matches common unsloth/TheBloke conventions):
       - a file inside a subfolder is grouped by that subfolder's name
@@ -71,15 +64,6 @@ def discover_quants(repo_id: str) -> list[Quant]:
     Files that can't be confidently grouped are skipped with a warning rather
     than raising, since new/unknown quant naming shows up regularly upstream.
     """
-    # mmproj-*.gguf files are a multimodal vision projector shared across quants,
-    # not a quant of the LLM itself, and would otherwise merge into whichever
-    # group happens to share its precision suffix (e.g. mmproj-BF16 into BF16).
-    files = [
-        f
-        for f in HfApi().list_repo_files(repo_id)
-        if f.lower().endswith(".gguf") and not f.rsplit("/", 1)[-1].lower().startswith("mmproj")
-    ]
-
     groups: dict[str, list[str]] = {}
     for path in files:
         key = path.split("/", 1)[0] if "/" in path else _match_quant_token(path.rsplit("/", 1)[-1])
@@ -92,3 +76,43 @@ def discover_quants(repo_id: str) -> list[Quant]:
         Quant(name=name, files=tuple(sorted(paths, key=_shard_index)))
         for name, paths in sorted(groups.items())
     ]
+
+
+def _sizes_from_info(info: ModelInfo) -> dict[str, int]:
+    siblings = info.siblings
+    if siblings is None:
+        return {}
+    return {s.rfilename: s.size for s in siblings if s.size is not None}
+
+
+def discover_quants_with_sizes(repo_id: str) -> tuple[list[Quant], dict[str, int]]:
+    """Discover a repo's quants and file sizes in a single API call.
+
+    Returns (quants, file_sizes) where file_sizes maps repo-relative path ->
+    size in bytes. Sizes are used to show a real download percentage instead
+    of an indeterminate spinner (`snapshot_download` itself doesn't expose the
+    total upfront). One `repo_info(..., files_metadata=True)` call serves both
+    instead of a separate files listing + metadata fetch.
+    """
+    info = HfApi().repo_info(repo_id, files_metadata=True)
+    assert isinstance(info, ModelInfo)
+    siblings = info.siblings if info.siblings is not None else []
+    files = [s.rfilename for s in siblings if _is_gguf(s.rfilename)]
+    return _group_files(files), _sizes_from_info(info)
+
+
+def discover_quants(repo_id: str) -> list[Quant]:
+    """List a repo's GGUF files and group them into quants."""
+    quants, _ = discover_quants_with_sizes(repo_id)
+    return quants
+
+
+def fetch_file_sizes(repo_id: str) -> dict[str, int]:
+    """Repo-relative path -> size in bytes, for every file in the repo.
+
+    Used to show a real download percentage instead of an indeterminate
+    spinner (`snapshot_download` itself doesn't expose the total upfront).
+    """
+    info = HfApi().repo_info(repo_id, files_metadata=True)
+    assert isinstance(info, ModelInfo)
+    return _sizes_from_info(info)

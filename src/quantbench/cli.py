@@ -10,7 +10,7 @@ from pathlib import Path
 from rich.console import Console
 
 from quantbench import __version__
-from quantbench.discovery import discover_quants
+from quantbench.discovery import discover_quants_with_sizes
 from quantbench.eval_runner import EvalResult, PassAtKStats
 from quantbench.orchestrator import QuantOutcome, run_pipeline
 from quantbench.report import write_chart, write_csv
@@ -46,18 +46,21 @@ def _load_outcome_from_summary(path: Path, *, run_key: str | None = None) -> Qua
         pass_at_k = None
         if res_data.get("pass_at_k"):
             pass_at_k = {int(k): v for k, v in res_data["pass_at_k"].items()}
-        # pass_at_k_per_task: {k: [per-task scores]}, keys are strings from json
+        # pass_at_k_per_task: {k: {task_id: score}}, both key levels strings from json
         pass_at_k_per_task = None
         raw_per_task = res_data.get("pass_at_k_per_task")
         if raw_per_task:
-            pass_at_k_per_task = {int(k): v for k, v in raw_per_task.items()}
+            pass_at_k_per_task = {int(k): dict(scores) for k, scores in raw_per_task.items()}
         result = EvalResult(
             base_pass1=res_data["base_pass1"],
             extra_pass1=res_data["extra_pass1"],
             n_problems=res_data["n_problems"],
             pass_at_k=pass_at_k,
             pass_at_k_stats=pass_at_k_stats,
+            # {k: {task_id: score}}; both key levels are strings from json.
             pass_at_k_per_task=pass_at_k_per_task,
+            avg_tok_s=res_data.get("avg_tok_s"),
+            wall_time_s=res_data.get("wall_time_s"),
         )
     return QuantOutcome(quant_name, size_bytes, result, error)
 
@@ -78,8 +81,16 @@ def _load_existing_outcomes(output_dir: Path, *, run_key: str | None = None) -> 
 
 
 def _run_key(args: argparse.Namespace) -> str:
-    """Deterministic key from parameters that affect benchmark results."""
-    return f"{args.limit}:{args.n_samples}:{args.temperature}:{args.pass_at_k}:{args.ctx_size}:{args.max_tokens}"
+    """Deterministic key from parameters that affect benchmark results.
+
+    Includes --gpu-layers (offloading changes both numerics and speed) and
+    --seed (affects sampling when temperature > 0). --parallel is deliberately
+    excluded: it changes only the reported throughput, never the accuracy.
+    """
+    return (
+        f"{args.limit}:{args.n_samples}:{args.temperature}:{args.pass_at_k}"
+        f":{args.ctx_size}:{args.max_tokens}:{args.gpu_layers}:{args.seed}"
+    )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -123,12 +134,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--temperature", type=float, default=0.0, help="Sampling temperature (default: 0.0 for greedy)"
     )
     parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed passed to llama-server (default: 42, for reproducible pass@k)"
+    )
+    parser.add_argument(
+        "--parallel", type=int, default=1,
+        help="Concurrent generations per quant (default: 1; also sets llama-server -np)"
+    )
+    parser.add_argument(
         "--pass-at-k",
         default=None,
         help="Comma-separated k values for pass@k reporting, e.g. 1,10,100 (default: 1)",
     )
     parser.add_argument(
         "--keep-downloads", action="store_true", help="Don't delete quants that this run downloaded"
+    )
+    parser.add_argument(
+        "--retry-failed", action="store_true",
+        help="Re-run quants whose previous attempt failed (by default their errors are cached on resume)"
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
@@ -150,6 +173,10 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --n-samples must be >= 1", file=sys.stderr)
         return 1
 
+    if args.parallel < 1:
+        print("error: --parallel must be >= 1", file=sys.stderr)
+        return 1
+
     pass_at_k: list[int] | None = None
     if args.pass_at_k:
         try:
@@ -164,9 +191,14 @@ def main(argv: list[str] | None = None) -> int:
             if k > args.n_samples:
                 print(f"error: pass@k={k} requires --n-samples >= {k} (got {args.n_samples})", file=sys.stderr)
                 return 1
+        if max(pass_at_k) > 1 and args.temperature == 0.0:
+            print(
+                "warning: --temperature 0 makes all samples identical, so pass@k will equal pass@1",
+                file=sys.stderr,
+            )
 
     print(f"discovering quants in {args.repo_id}...")
-    quants = discover_quants(args.repo_id)
+    quants, file_sizes = discover_quants_with_sizes(args.repo_id)
     if not quants:
         print("error: no GGUF quants found in this repo", file=sys.stderr)
         return 1
@@ -202,6 +234,9 @@ def main(argv: list[str] | None = None) -> int:
     # Load any previously completed quants so we can resume
     current_run_key = _run_key(args)
     existing_outcomes = _load_existing_outcomes(output_dir, run_key=current_run_key)
+    if args.retry_failed:
+        # Drop cached error outcomes so those quants get benchmarked again.
+        existing_outcomes = {n: o for n, o in existing_outcomes.items() if o.error is None}
     existing_names = set(existing_outcomes.keys())
     # Filter out quants already completed
     remaining_quants = [q for q in quants if q.name not in existing_names]
@@ -225,6 +260,9 @@ def main(argv: list[str] | None = None) -> int:
             pass_at_k=pass_at_k,
             keep_downloads=args.keep_downloads,
             max_tokens=args.max_tokens,
+            file_sizes=file_sizes,
+            parallel=args.parallel,
+            seed=args.seed,
         )
 
     # Merge existing and new outcomes, preserving order
@@ -239,10 +277,16 @@ def main(argv: list[str] | None = None) -> int:
     write_chart(ordered_outcomes, output_dir / "results.png", repo_id=args.repo_id)
 
     n_ok = sum(1 for o in ordered_outcomes if o.result is not None)
+    n_failed = len(ordered_outcomes) - n_ok
     print(f"\ndone: {n_ok}/{len(ordered_outcomes)} quants benchmarked successfully")
     print(f"results: {output_dir / 'results.csv'}")
     print(f"chart:   {output_dir / 'results.png'}")
-    return 0 if n_ok else 1
+    if n_failed:
+        print(
+            f"warning: {n_failed} quant(s) failed; rerun with --retry-failed to retry them",
+            file=sys.stderr,
+        )
+    return 0 if n_failed == 0 else 1
 
 
 if __name__ == "__main__":

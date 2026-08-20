@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -38,6 +39,10 @@ class TestParseArgsBasic:
         assert args.output_dir is None
         assert args.pass_at_k is None
         assert args.keep_downloads is False
+        assert args.max_tokens == 32000
+        assert args.seed == 42
+        assert args.parallel == 1
+        assert args.retry_failed is False
 
     def test_all_flags(self) -> None:
         args = _parse_args(
@@ -65,6 +70,13 @@ class TestParseArgsBasic:
                 "1,10",
                 "--keep-downloads",
                 "--list-quants",
+                "--max-tokens",
+                "8192",
+                "--seed",
+                "7",
+                "--parallel",
+                "4",
+                "--retry-failed",
             ]
         )
         assert args.repo_id == "author/model"
@@ -80,6 +92,10 @@ class TestParseArgsBasic:
         assert args.pass_at_k == "1,10"
         assert args.keep_downloads is True
         assert args.list_quants is True
+        assert args.max_tokens == 8192
+        assert args.seed == 7
+        assert args.parallel == 4
+        assert args.retry_failed is True
 
 
 class TestParseArgsVersion:
@@ -216,7 +232,7 @@ class TestRunKey:
     def test_default_values(self) -> None:
         args = _parse_args(["author/model"])
         key = _run_key(args)
-        assert key == "None:1:0.0:None:None:32000"
+        assert key == "None:1:0.0:None:None:32000:all:42"
 
     def test_custom_values(self) -> None:
         args = _parse_args(
@@ -235,7 +251,7 @@ class TestRunKey:
             ]
         )
         key = _run_key(args)
-        assert key == "5:10:0.5:1,10:8192:32000"
+        assert key == "5:10:0.5:1,10:8192:32000:all:42"
 
     def test_deterministic(self) -> None:
         """Same arguments produce the same key."""
@@ -284,7 +300,26 @@ class TestRunKey:
         args = _parse_args(["author/model"])
         key = _run_key(args)
         parts = key.split(":")
-        assert len(parts) == 6  # limit:n_samples:temperature:pass_at_k:ctx_size:max_tokens
+        assert len(parts) == 8  # limit:n_samples:temperature:pass_at_k:ctx_size:max_tokens:gpu_layers:seed
+        # (pass_at_k may be a comma-joined string, so this count is exact only
+        # for the default args where pass_at_k is None)
+
+    def test_different_gpu_layers_changes_key(self) -> None:
+        """Offloading changes numerics, so cached results must not be reused."""
+        args1 = _parse_args(["author/model", "--gpu-layers", "all"])
+        args2 = _parse_args(["author/model", "--gpu-layers", "32"])
+        assert _run_key(args1) != _run_key(args2)
+
+    def test_different_seed_changes_key(self) -> None:
+        args1 = _parse_args(["author/model", "--seed", "1"])
+        args2 = _parse_args(["author/model", "--seed", "2"])
+        assert _run_key(args1) != _run_key(args2)
+
+    def test_parallel_not_in_key(self) -> None:
+        """Parallelism changes throughput, never accuracy: it must not invalidate the cache."""
+        args1 = _parse_args(["author/model", "--parallel", "1"])
+        args2 = _parse_args(["author/model", "--parallel", "8"])
+        assert _run_key(args1) == _run_key(args2)
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +330,7 @@ class TestNoQuantsFound:
     """Error when discover_quants returns empty list."""
 
     def test_no_quants_error(self, capsys: pytest.CaptureFixture) -> None:
-        with patch("quantbench.cli.discover_quants", return_value=[]):
+        with patch("quantbench.cli.discover_quants_with_sizes", return_value=([], {})):
             code = main(["author/model"])
         assert code == 1
         assert "no GGUF quants found" in capsys.readouterr().err
@@ -315,7 +350,7 @@ class TestListQuants:
             Quant(name="Q4_K_M", files=("model-Q4_K_M.gguf",)),
             Quant(name="Q8_0", files=("model-Q8_0-00001-of-00002.gguf", "model-Q8_0-00002-of-00002.gguf")),
         ]
-        with patch("quantbench.cli.discover_quants", return_value=mock_quants):
+        with patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})):
             code = main(["author/model", "--list-quants"])
         assert code == 0
         output = capsys.readouterr().out
@@ -335,7 +370,7 @@ class TestUnknownQuantValidation:
         from quantbench.discovery import Quant
 
         mock_quants = [Quant(name="Q4_K_M", files=("model-Q4_K_M.gguf",))]
-        with patch("quantbench.cli.discover_quants", return_value=mock_quants):
+        with patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})):
             code = main(["author/model", "--quants", "Q8_0"])
         assert code == 1
         err = capsys.readouterr().err
@@ -345,7 +380,7 @@ class TestUnknownQuantValidation:
         from quantbench.discovery import Quant
 
         mock_quants = [Quant(name="Q4_K_M", files=("model-Q4_K_M.gguf",))]
-        with patch("quantbench.cli.discover_quants", return_value=mock_quants):
+        with patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})):
             code = main(["author/model", "--quants-except", "Q8_0"])
         assert code == 1
         err = capsys.readouterr().err
@@ -367,7 +402,7 @@ class TestQuantSelection:
             Quant(name="Q8_0", files=("model-Q8_0.gguf",)),
         ]
         with (
-            patch("quantbench.cli.discover_quants", return_value=mock_quants),
+            patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
             patch("quantbench.cli.create_display") as mock_display,
             patch("quantbench.cli.run_pipeline", return_value=[]),
             patch("quantbench.cli._load_existing_outcomes", return_value={}),
@@ -388,7 +423,7 @@ class TestQuantSelection:
             Quant(name="Q8_0", files=("model-Q8_0.gguf",)),
         ]
         with (
-            patch("quantbench.cli.discover_quants", return_value=mock_quants),
+            patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
             patch("quantbench.cli.create_display") as mock_display,
             patch("quantbench.cli.run_pipeline", return_value=[]),
             patch("quantbench.cli._load_existing_outcomes", return_value={}),
@@ -414,7 +449,7 @@ class TestResumeDetection:
 
         mock_quants = [Quant(name="Q4_K_M", files=("model-Q4_K_M.gguf",))]
         with (
-            patch("quantbench.cli.discover_quants", return_value=mock_quants),
+            patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
             patch("quantbench.cli._load_existing_outcomes", return_value={}),
             patch("quantbench.cli.create_display") as mock_display,
             patch("quantbench.cli.run_pipeline") as mock_run,
@@ -442,7 +477,7 @@ class TestResumeDetection:
         ]
         existing = {"Q4_K_M": QuantOutcome("Q4_K_M", 1000, None, None)}
         with (
-            patch("quantbench.cli.discover_quants", return_value=mock_quants),
+            patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
             patch("quantbench.cli._load_existing_outcomes", return_value=existing),
             patch("quantbench.cli.create_display") as mock_display,
             patch("quantbench.cli.run_pipeline") as mock_run,
@@ -459,3 +494,221 @@ class TestResumeDetection:
             passed_quants = args[1]  # remaining_quants is positional arg #2
             assert len(passed_quants) == 1
             assert passed_quants[0].name == "Q8_0"
+
+
+# ---------------------------------------------------------------------------
+# main(): --parallel validation
+# ---------------------------------------------------------------------------
+
+class TestParallelValidation:
+    """--parallel must be >= 1."""
+
+    def test_zero_parallel(self, capsys: pytest.CaptureFixture) -> None:
+        code = main(["author/model", "--parallel", "0"])
+        assert code == 1
+        assert "must be >= 1" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# main(): exit codes
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def _patch_full_run(mock_quants, new_outcomes):
+    """Patch everything main() touches after argument validation."""
+    with (
+        patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
+        patch("quantbench.cli._load_existing_outcomes", return_value={}),
+        patch("quantbench.cli.create_display"),
+        patch("quantbench.cli.run_pipeline", return_value=new_outcomes),
+        patch("quantbench.cli.write_csv"),
+        patch("quantbench.cli.write_chart"),
+        patch.object(Path, "mkdir"),
+        patch.object(Path, "exists", return_value=False),
+    ):
+        yield
+
+
+class TestExitCodes:
+    """main() returns 0 only when every selected quant succeeded."""
+
+    def test_all_success_returns_zero(self, capsys: pytest.CaptureFixture) -> None:
+        from quantbench.discovery import Quant
+        from quantbench.eval_runner import EvalResult
+        from quantbench.orchestrator import QuantOutcome
+
+        mock_quants = [Quant(name="Q4_K_M", files=("model.gguf",))]
+        new_outcomes = [
+            QuantOutcome("Q4_K_M", 1000, EvalResult(base_pass1=0.5, extra_pass1=0.4, n_problems=100), None)
+        ]
+        with _patch_full_run(mock_quants, new_outcomes):
+            code = main(["author/model"])
+        assert code == 0
+        assert "1/1 quants benchmarked successfully" in capsys.readouterr().out
+
+    def test_partial_failure_returns_one(self, capsys: pytest.CaptureFixture) -> None:
+        from quantbench.discovery import Quant
+        from quantbench.eval_runner import EvalResult
+        from quantbench.orchestrator import QuantOutcome
+
+        mock_quants = [
+            Quant(name="Q4_K_M", files=("a.gguf",)),
+            Quant(name="Q8_0", files=("b.gguf",)),
+        ]
+        new_outcomes = [
+            QuantOutcome("Q4_K_M", 1000, EvalResult(base_pass1=0.5, extra_pass1=0.4, n_problems=100), None),
+            QuantOutcome("Q8_0", 2000, None, error="server crashed"),
+        ]
+        with _patch_full_run(mock_quants, new_outcomes):
+            code = main(["author/model"])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "1 quant(s) failed" in err
+        assert "--retry-failed" in err
+
+    def test_failure_in_existing_outcome_counts(self, capsys: pytest.CaptureFixture) -> None:
+        """Cached error outcomes from a previous run also make the exit code 1."""
+        from quantbench.discovery import Quant
+        from quantbench.orchestrator import QuantOutcome
+
+        mock_quants = [Quant(name="Q4_K_M", files=("a.gguf",))]
+        existing = {"Q4_K_M": QuantOutcome("Q4_K_M", 1000, None, error="old failure")}
+        with (
+            patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
+            patch("quantbench.cli._load_existing_outcomes", return_value=existing),
+            patch("quantbench.cli.create_display"),
+            patch("quantbench.cli.run_pipeline", return_value=[]),
+            patch("quantbench.cli.write_csv"),
+            patch("quantbench.cli.write_chart"),
+            patch.object(Path, "mkdir"),
+            patch.object(Path, "exists", return_value=False),
+        ):
+            code = main(["author/model"])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "1 quant(s) failed" in err
+
+
+# ---------------------------------------------------------------------------
+# main(): --retry-failed
+# ---------------------------------------------------------------------------
+
+class TestRetryFailed:
+    """--retry-failed drops cached error outcomes so those quants are re-run."""
+
+    def _existing(self):
+        from quantbench.eval_runner import EvalResult
+        from quantbench.orchestrator import QuantOutcome
+
+        return {
+            "Q4_K_M": QuantOutcome("Q4_K_M", 1000, None, error="old failure"),
+            "Q8_0": QuantOutcome(
+                "Q8_0", 2000,
+                EvalResult(base_pass1=0.6, extra_pass1=0.5, n_problems=100), None,
+            ),
+        }
+
+    def test_retry_failed_reruns_only_errors(self) -> None:
+        from quantbench.discovery import Quant
+
+        mock_quants = [
+            Quant(name="Q4_K_M", files=("a.gguf",)),
+            Quant(name="Q8_0", files=("b.gguf",)),
+        ]
+        with (
+            patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
+            patch("quantbench.cli._load_existing_outcomes", return_value=self._existing()),
+            patch("quantbench.cli.create_display"),
+            patch("quantbench.cli.run_pipeline") as mock_run,
+            patch("quantbench.cli.write_csv"),
+            patch("quantbench.cli.write_chart"),
+            patch.object(Path, "mkdir"),
+            patch.object(Path, "exists", return_value=False),
+        ):
+            mock_run.return_value = []
+            main(["author/model", "--retry-failed"])
+            passed_quants = mock_run.call_args.args[1]
+            assert [q.name for q in passed_quants] == ["Q4_K_M"]
+
+    def test_without_flag_errors_are_cached(self) -> None:
+        from quantbench.discovery import Quant
+
+        mock_quants = [
+            Quant(name="Q4_K_M", files=("a.gguf",)),
+            Quant(name="Q8_0", files=("b.gguf",)),
+        ]
+        with (
+            patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
+            patch("quantbench.cli._load_existing_outcomes", return_value=self._existing()),
+            patch("quantbench.cli.create_display"),
+            patch("quantbench.cli.run_pipeline") as mock_run,
+            patch("quantbench.cli.write_csv"),
+            patch("quantbench.cli.write_chart"),
+            patch.object(Path, "mkdir"),
+            patch.object(Path, "exists", return_value=False),
+        ):
+            mock_run.return_value = []
+            main(["author/model"])
+            passed_quants = mock_run.call_args.args[1]
+            assert passed_quants == []
+
+
+# ---------------------------------------------------------------------------
+# main(): greedy pass@k warning
+# ---------------------------------------------------------------------------
+
+class TestGreedyPassAtKWarning:
+    """pass@k > 1 with temperature 0 warns that samples will be identical."""
+
+    def test_warning_printed(self, capsys: pytest.CaptureFixture) -> None:
+        from quantbench.discovery import Quant
+
+        mock_quants = [Quant(name="Q4_K_M", files=("a.gguf",))]
+        with (
+            patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
+            patch("quantbench.cli._load_existing_outcomes", return_value={}),
+            patch("quantbench.cli.create_display"),
+            patch("quantbench.cli.run_pipeline", return_value=[]),
+            patch("quantbench.cli.write_csv"),
+            patch("quantbench.cli.write_chart"),
+            patch.object(Path, "mkdir"),
+            patch.object(Path, "exists", return_value=False),
+        ):
+            code = main(["author/model", "--n-samples", "5", "--pass-at-k", "1,5"])
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "identical" in err
+
+    def test_no_warning_with_temperature(self, capsys: pytest.CaptureFixture) -> None:
+        from quantbench.discovery import Quant
+
+        mock_quants = [Quant(name="Q4_K_M", files=("a.gguf",))]
+        with (
+            patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
+            patch("quantbench.cli._load_existing_outcomes", return_value={}),
+            patch("quantbench.cli.create_display"),
+            patch("quantbench.cli.run_pipeline", return_value=[]),
+            patch("quantbench.cli.write_csv"),
+            patch("quantbench.cli.write_chart"),
+            patch.object(Path, "mkdir"),
+            patch.object(Path, "exists", return_value=False),
+        ):
+            main(["author/model", "--n-samples", "5", "--pass-at-k", "1,5", "--temperature", "0.7"])
+        assert "identical" not in capsys.readouterr().err
+
+    def test_no_warning_for_k1_only(self, capsys: pytest.CaptureFixture) -> None:
+        from quantbench.discovery import Quant
+
+        mock_quants = [Quant(name="Q4_K_M", files=("a.gguf",))]
+        with (
+            patch("quantbench.cli.discover_quants_with_sizes", return_value=(mock_quants, {})),
+            patch("quantbench.cli._load_existing_outcomes", return_value={}),
+            patch("quantbench.cli.create_display"),
+            patch("quantbench.cli.run_pipeline", return_value=[]),
+            patch("quantbench.cli.write_csv"),
+            patch("quantbench.cli.write_chart"),
+            patch.object(Path, "mkdir"),
+            patch.object(Path, "exists", return_value=False),
+        ):
+            main(["author/model", "--pass-at-k", "1"])
+        assert "identical" not in capsys.readouterr().err

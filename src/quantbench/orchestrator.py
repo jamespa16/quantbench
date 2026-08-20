@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from quantbench.discovery import Quant, fetch_file_sizes
+from quantbench.discovery import Quant
 from quantbench.eval_runner import EvalResult, run_humaneval_plus
 from quantbench.hf_cache import DownloadedQuant, cleanup_quant, download_quant, was_cached
 from quantbench.llama_server import LlamaServer
@@ -49,6 +49,8 @@ def _write_summary(quant_dir: Path, outcome: QuantOutcome, *, run_key: str) -> N
                 if res.pass_at_k_stats else None
             ),
             "pass_at_k_per_task": res.pass_at_k_per_task,
+            "avg_tok_s": res.avg_tok_s,
+            "wall_time_s": res.wall_time_s,
         }
     else:
         data["result"] = None
@@ -62,6 +64,7 @@ def run_pipeline(
     output_dir: Path,
     display: BenchDisplay,
     *,
+    file_sizes: dict[str, int],
     run_key: str = "",
     cache_dir: str | None = None,
     llama_server_bin: str = "llama-server",
@@ -73,6 +76,8 @@ def run_pipeline(
     pass_at_k: list[int] | None = None,
     keep_downloads: bool = False,
     max_tokens: int = 32000,
+    parallel: int = 1,
+    seed: int | None = None,
 ) -> list[QuantOutcome]:
     """Benchmark each quant in order, downloading quant N+1 while quant N is tested.
 
@@ -88,7 +93,6 @@ def run_pipeline(
     """
     # Must be captured before any download in this run touches the cache.
     pre_existing = {q.name: was_cached(repo_id, q, cache_dir=cache_dir) for q in quants}
-    file_sizes = fetch_file_sizes(repo_id)
 
     ready: queue.Queue = queue.Queue(maxsize=1)
     permission: queue.Queue = queue.Queue(maxsize=1)
@@ -150,6 +154,10 @@ def run_pipeline(
                 gpu_layers=gpu_layers,
                 ctx_size=ctx_size,
                 log_path=str(quant_dir / "llama-server.log"),
+                # Scale the per-request timeout with the generation budget so
+                # slow/CPU-only machines don't kill legitimate long runs.
+                request_timeout=max(600.0, max_tokens / 5.0),
+                parallel=parallel,
             )
             with server:
                 display.start_eval(downloaded.quant.name)
@@ -161,6 +169,8 @@ def run_pipeline(
                     pass_at_k=pass_at_k,
                     on_problem_done=display.on_problem_done,
                     max_tokens=max_tokens,
+                    parallel=parallel,
+                    seed=seed,
                 )
             pass1_str = (
                 f"pass@1={result.extra_pass1:.3f} "
@@ -173,7 +183,8 @@ def run_pipeline(
                     st = result.pass_at_k_stats[k]
                     parts.append(f"pass@{k}={st.mean:.3f} ±{st.std_error:.3f}")
                 passk_str = f" [{', '.join(parts)}]"
-            display.log(f"  {downloaded.quant.name}: {pass1_str}{passk_str}")
+            speed_str = f" {result.avg_tok_s:.1f} tok/s" if result.avg_tok_s else ""
+            display.log(f"  {downloaded.quant.name}: {pass1_str}{passk_str}{speed_str}")
             outcome = QuantOutcome(downloaded.quant.name, size_bytes, result)
             outcomes.append(outcome)
             _write_summary(quant_dir, outcome, run_key=run_key)

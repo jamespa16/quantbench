@@ -8,7 +8,14 @@ from unittest.mock import patch
 import pytest
 from huggingface_hub import ModelInfo
 
-from quantbench.discovery import Quant, _match_quant_token, _shard_index, discover_quants, fetch_file_sizes
+from quantbench.discovery import (
+    Quant,
+    _match_quant_token,
+    _shard_index,
+    discover_quants,
+    discover_quants_with_sizes,
+    fetch_file_sizes,
+)
 
 # ---------------------------------------------------------------------------
 # _match_quant_token
@@ -194,6 +201,19 @@ class TestMatchQuantTokenRejectsUnknown:
 
 
 # ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _model_info(files):
+    """A ModelInfo whose siblings are the given repo-relative paths."""
+    return ModelInfo(
+        id="author/model",
+        siblings=[{"rfilename": f, "size": None} for f in files],
+    )
+
+
+# ---------------------------------------------------------------------------
 # _shard_index
 # ---------------------------------------------------------------------------
 
@@ -258,7 +278,7 @@ class TestDiscoverQuantsSubfolder:
             "Q8_0/model-Q8_0.gguf",
         ]
         with patch("quantbench.discovery.HfApi") as mock_api:
-            mock_api.return_value.list_repo_files.return_value = files
+            mock_api.return_value.repo_info.return_value = _model_info(files)
             quants = discover_quants("author/model")
         names = [q.name for q in quants]
         assert names == ["Q4_K_M", "Q8_0"]
@@ -271,7 +291,7 @@ class TestDiscoverQuantsSubfolder:
             "Q4_K_M/model-00002-of-00004.gguf",
         ]
         with patch("quantbench.discovery.HfApi") as mock_api:
-            mock_api.return_value.list_repo_files.return_value = files
+            mock_api.return_value.repo_info.return_value = _model_info(files)
             quants = discover_quants("author/model")
         assert len(quants) == 1
         q = quants[0]
@@ -282,7 +302,7 @@ class TestDiscoverQuantsSubfolder:
         """Quant names are returned sorted alphabetically."""
         files = ["Z_quant/model.gguf", "A_quant/model.gguf"]
         with patch("quantbench.discovery.HfApi") as mock_api:
-            mock_api.return_value.list_repo_files.return_value = files
+            mock_api.return_value.repo_info.return_value = _model_info(files)
             quants = discover_quants("author/model")
         assert [q.name for q in quants] == ["A_quant", "Z_quant"]
 
@@ -297,7 +317,7 @@ class TestDiscoverQuantsFlat:
             "model-IQ2_XS.gguf",
         ]
         with patch("quantbench.discovery.HfApi") as mock_api:
-            mock_api.return_value.list_repo_files.return_value = files
+            mock_api.return_value.repo_info.return_value = _model_info(files)
             quants = discover_quants("author/model")
         names = [q.name for q in quants]
         assert names == ["IQ2_XS", "Q4_K_M", "Q8_0"]
@@ -309,7 +329,7 @@ class TestDiscoverQuantsFlat:
             "model-Q8_0-00002-of-00002.gguf",
         ]
         with patch("quantbench.discovery.HfApi") as mock_api:
-            mock_api.return_value.list_repo_files.return_value = files
+            mock_api.return_value.repo_info.return_value = _model_info(files)
             quants = discover_quants("author/model")
         assert len(quants) == 2
         q8 = next(q for q in quants if q.name == "Q8_0")
@@ -322,7 +342,7 @@ class TestDiscoverQuantsUnknow:
     def test_unknown_file_skipped(self, capsys: pytest.CaptureFixture) -> None:
         files = ["model-Q4_K_M.gguf", "model-UNKNOWN.gguf"]
         with patch("quantbench.discovery.HfApi") as mock_api:
-            mock_api.return_value.list_repo_files.return_value = files
+            mock_api.return_value.repo_info.return_value = _model_info(files)
             quants = discover_quants("author/model")
         assert len(quants) == 1
         assert quants[0].name == "Q4_K_M"
@@ -342,7 +362,7 @@ class TestMmprojFilter:
             "mmproj-BF16.gguf",
         ]
         with patch("quantbench.discovery.HfApi") as mock_api:
-            mock_api.return_value.list_repo_files.return_value = files
+            mock_api.return_value.repo_info.return_value = _model_info(files)
             quants = discover_quants("author/model")
         names = [q.name for q in quants]
         assert names == ["Q4_K_M"]
@@ -353,7 +373,7 @@ class TestMmprojFilter:
             "mmproj/mmproj-F16.gguf",
         ]
         with patch("quantbench.discovery.HfApi") as mock_api:
-            mock_api.return_value.list_repo_files.return_value = files
+            mock_api.return_value.repo_info.return_value = _model_info(files)
             quants = discover_quants("author/model")
         names = [q.name for q in quants]
         assert names == ["Q4_K_M"]
@@ -366,7 +386,7 @@ class TestMmprojFilter:
             "MMPROJ-BF16.gguf",
         ]
         with patch("quantbench.discovery.HfApi") as mock_api:
-            mock_api.return_value.list_repo_files.return_value = files
+            mock_api.return_value.repo_info.return_value = _model_info(files)
             quants = discover_quants("author/model")
         names = [q.name for q in quants]
         assert names == ["Q4_K_M"]
@@ -374,7 +394,7 @@ class TestMmprojFilter:
     def test_only_mmproj_returns_empty(self) -> None:
         files = ["mmproj-BF16.gguf"]
         with patch("quantbench.discovery.HfApi") as mock_api:
-            mock_api.return_value.list_repo_files.return_value = files
+            mock_api.return_value.repo_info.return_value = _model_info(files)
             quants = discover_quants("author/model")
         assert quants == []
 
@@ -456,3 +476,63 @@ class TestQuantDataclass:
         q = Quant(name="Q4_K_M", files=("model-Q4_K_M.gguf",))
         with pytest.raises(dataclasses.FrozenInstanceError):
             q.name = "Q8_0"  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# discover_quants_with_sizes
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverQuantsWithSizes:
+    """One API call yields both the quant list and the file sizes."""
+
+    def test_single_repo_info_call(self) -> None:
+        files = ["model-Q4_K_M.gguf", "model-Q8_0.gguf", "README.md"]
+        with patch("quantbench.discovery.HfApi") as mock_api:
+            mock_api.return_value.repo_info.return_value = _model_info(files)
+            quants, sizes = discover_quants_with_sizes("author/model")
+        mock_api.return_value.repo_info.assert_called_once_with("author/model", files_metadata=True)
+        # the old two-call path must be gone
+        mock_api.return_value.list_repo_files.assert_not_called()
+        assert [q.name for q in quants] == ["Q4_K_M", "Q8_0"]
+        # no sizes were known, so the dict is empty
+        assert sizes == {}
+
+    def test_sizes_include_non_gguf_files(self) -> None:
+        info = ModelInfo(
+            id="author/model",
+            siblings=[
+                {"rfilename": "model-Q4_K_M.gguf", "size": 4000},
+                {"rfilename": "model-Q8_0.gguf", "size": 8000},
+                {"rfilename": "README.md", "size": 100},
+            ],
+        )
+        with patch("quantbench.discovery.HfApi") as mock_api:
+            mock_api.return_value.repo_info.return_value = info
+            quants, sizes = discover_quants_with_sizes("author/model")
+        assert len(quants) == 2
+        assert sizes == {
+            "model-Q4_K_M.gguf": 4000,
+            "model-Q8_0.gguf": 8000,
+            "README.md": 100,
+        }
+
+    def test_null_size_filtered(self) -> None:
+        info = ModelInfo(
+            id="author/model",
+            siblings=[
+                {"rfilename": "model-Q4_K_M.gguf", "size": 4000},
+                {"rfilename": "model-Q8_0.gguf", "size": None},
+            ],
+        )
+        with patch("quantbench.discovery.HfApi") as mock_api:
+            mock_api.return_value.repo_info.return_value = info
+            _, sizes = discover_quants_with_sizes("author/model")
+        assert sizes == {"model-Q4_K_M.gguf": 4000}
+
+    def test_empty_repo(self) -> None:
+        with patch("quantbench.discovery.HfApi") as mock_api:
+            mock_api.return_value.repo_info.return_value = ModelInfo(id="author/model", siblings=[])
+            quants, sizes = discover_quants_with_sizes("author/model")
+        assert quants == []
+        assert sizes == {}

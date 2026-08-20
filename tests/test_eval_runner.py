@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import threading
+import time
 
 import pytest
 
@@ -11,8 +13,10 @@ from quantbench.eval_runner import (
     _STUB_SUFFIX,
     EvalResult,
     PassAtKStats,
+    _generate_samples,
     _pass_at_k,
 )
+from quantbench.llama_server import GenerateResult
 
 # ---------------------------------------------------------------------------
 # _pass_at_k edge cases
@@ -184,6 +188,8 @@ class TestEvalResultConstruction:
         assert result.pass_at_k is None
         assert result.pass_at_k_stats is None
         assert result.pass_at_k_per_task is None
+        assert result.avg_tok_s is None
+        assert result.wall_time_s is None
 
     def test_eval_result_with_pass_at_k(self) -> None:
         """EvalResult with pass_at_k should populate all fields."""
@@ -192,7 +198,10 @@ class TestEvalResultConstruction:
             1: PassAtKStats(mean=0.5, std_dev=0.1, std_error=0.01),
             5: PassAtKStats(mean=0.6, std_dev=0.12, std_error=0.012),
         }
-        per_task = {1: [0.5, 0.6, 0.4], 5: [0.6, 0.7, 0.5]}
+        per_task = {
+            1: {"HumanEval/0": 0.5, "HumanEval/1": 0.6, "HumanEval/2": 0.4},
+            5: {"HumanEval/0": 0.6, "HumanEval/1": 0.7, "HumanEval/2": 0.5},
+        }
         result = EvalResult(
             base_pass1=0.5,
             extra_pass1=0.4,
@@ -200,10 +209,14 @@ class TestEvalResultConstruction:
             pass_at_k=pass_at_k,
             pass_at_k_stats=stats,
             pass_at_k_per_task=per_task,
+            avg_tok_s=55.5,
+            wall_time_s=123.4,
         )
         assert result.pass_at_k == pass_at_k
         assert result.pass_at_k_stats == stats
         assert result.pass_at_k_per_task == per_task
+        assert result.avg_tok_s == 55.5
+        assert result.wall_time_s == 123.4
 
     def test_pass_at_k_stats_fields(self) -> None:
         """PassAtKStats has mean, std_dev, and std_error."""
@@ -237,11 +250,12 @@ class TestEvalResultBasePassAtK:
 
 
 class TestEvalResultPerTaskScores:
-    """Test per-task pass@k score distributions."""
+    """Per-task pass@k scores are keyed by task id, so different quants can be
+    compared on their common tasks."""
 
     def test_all_tasks_pass(self) -> None:
         """All tasks with 100% correct should have pass@k = 1.0 per task."""
-        per_task = {1: [1.0, 1.0, 1.0]}
+        per_task = {1: {f"HumanEval/{i}": 1.0 for i in range(3)}}
         result = EvalResult(
             base_pass1=1.0,
             extra_pass1=1.0,
@@ -249,11 +263,12 @@ class TestEvalResultPerTaskScores:
             pass_at_k={1: 1.0},
             pass_at_k_per_task=per_task,
         )
-        assert result.pass_at_k_per_task[1] == [1.0, 1.0, 1.0]
+        assert result.pass_at_k_per_task is not None
+        assert result.pass_at_k_per_task[1] == {f"HumanEval/{i}": 1.0 for i in range(3)}
 
     def test_mixed_task_scores(self) -> None:
         """Mixed per-task scores produce correct mean."""
-        per_task = {1: [1.0, 0.5, 0.0]}
+        per_task = {1: {"HumanEval/0": 1.0, "HumanEval/1": 0.5, "HumanEval/2": 0.0}}
         result = EvalResult(
             base_pass1=0.5,
             extra_pass1=0.5,
@@ -261,14 +276,16 @@ class TestEvalResultPerTaskScores:
             pass_at_k={1: 1.0 / 3},
             pass_at_k_per_task=per_task,
         )
+        assert result.pass_at_k is not None
         assert math.isclose(result.pass_at_k[1], 1.0 / 3)
 
     def test_stats_match_per_task_mean(self) -> None:
         """PassAtKStats mean should equal the mean of per-task scores."""
-        per_task = [0.2, 0.4, 0.6, 0.8]
-        mean_val = sum(per_task) / len(per_task)
-        n_tasks = len(per_task)
-        variance = sum((s - mean_val) ** 2 for s in per_task) / (n_tasks - 1)
+        per_task = {f"HumanEval/{i}": s for i, s in enumerate([0.2, 0.4, 0.6, 0.8])}
+        scores = list(per_task.values())
+        mean_val = sum(scores) / len(scores)
+        n_tasks = len(scores)
+        variance = sum((s - mean_val) ** 2 for s in scores) / (n_tasks - 1)
         std_dev = math.sqrt(variance)
         std_error = std_dev / math.sqrt(n_tasks)
 
@@ -282,6 +299,143 @@ class TestEvalResultPerTaskScores:
             },
             pass_at_k_per_task={1: per_task},
         )
+        assert result.pass_at_k_stats is not None
         assert math.isclose(result.pass_at_k_stats[1].mean, mean_val)
         assert math.isclose(result.pass_at_k_stats[1].std_dev, std_dev)
         assert math.isclose(result.pass_at_k_stats[1].std_error, std_error)
+
+
+# ---------------------------------------------------------------------------
+# _generate_samples
+# ---------------------------------------------------------------------------
+
+
+class _FakeServer:
+    """Stands in for LlamaServer; records calls and can sleep to force overlap."""
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.calls: list[tuple[str, int | None]] = []  # (task_id, seed)
+        self._active = 0
+        self.max_concurrency = 0
+        self._lock = threading.Lock()
+
+    def generate(self, prompt, *, system, temperature, max_tokens, seed=None):
+        with self._lock:
+            self._active += 1
+            self.max_concurrency = max(self.max_concurrency, self._active)
+        if self.delay:
+            time.sleep(self.delay)
+        with self._lock:
+            self._active -= 1
+        self.calls.append((prompt, seed))
+        return GenerateResult(text=f"# answer for {prompt}", completion_tokens=7, elapsed_s=0.5)
+
+
+class TestGenerateSamples:
+    """_generate_samples: ordering, callbacks, and parallelism."""
+
+    @staticmethod
+    def _problems(task_ids: list[str]) -> dict:
+        return {tid: {"prompt": tid} for tid in task_ids}
+
+    def test_serial_order_and_tokens(self) -> None:
+        server = _FakeServer()
+        task_ids = ["HumanEval/0", "HumanEval/1", "HumanEval/2"]
+        samples, wall_time, total_tokens = _generate_samples(
+            server, self._problems(task_ids), task_ids,
+            n_samples=1, temperature=0.0, max_tokens=100, parallel=1, seed=42,
+        )
+        assert [s["task_id"] for s in samples] == task_ids
+        assert [s["solution"] for s in samples] == [f"# answer for {t}" for t in task_ids]
+        assert total_tokens == 21
+        assert wall_time >= 0.0
+        # every call carries the seed
+        assert all(seed == 42 for _, seed in server.calls)
+
+    def test_no_callback_by_default(self) -> None:
+        server = _FakeServer()
+        _generate_samples(
+            server, self._problems(["HumanEval/0"]), ["HumanEval/0"],
+            n_samples=1, temperature=0.0, max_tokens=100, parallel=1, seed=None,
+        )
+        assert server.calls == [("HumanEval/0", None)]
+
+    def test_on_problem_done_serial_counts(self) -> None:
+        """Serial: callbacks fire in order with cumulative completed counts."""
+        server = _FakeServer()
+        task_ids = ["HumanEval/0", "HumanEval/1", "HumanEval/2"]
+        events = []
+        _generate_samples(
+            server, self._problems(task_ids), task_ids,
+            n_samples=1, temperature=0.0, max_tokens=100, parallel=1, seed=None,
+            on_problem_done=lambda done, total, tokens, t: events.append((done, total, tokens)),
+        )
+        assert events == [(1, 3, 7), (2, 3, 7), (3, 3, 7)]
+
+    def test_on_problem_done_fires_after_all_samples(self) -> None:
+        """With n_samples=2 the task callback fires once, after both samples, with summed tokens."""
+        server = _FakeServer()
+        task_ids = ["HumanEval/0", "HumanEval/1"]
+        events = []
+        _generate_samples(
+            server, self._problems(task_ids), task_ids,
+            n_samples=2, temperature=0.0, max_tokens=100, parallel=1, seed=None,
+            on_problem_done=lambda done, total, tokens, t: events.append((done, tokens)),
+        )
+        assert len(events) == 2
+        assert all(tokens == 14 for _, tokens in events)  # 2 samples x 7 tokens
+
+    def test_multiple_samples_task_major_order(self) -> None:
+        server = _FakeServer()
+        task_ids = ["HumanEval/0", "HumanEval/1"]
+        samples, _, _ = _generate_samples(
+            server, self._problems(task_ids), task_ids,
+            n_samples=3, temperature=0.0, max_tokens=100, parallel=1, seed=None,
+        )
+        assert [s["task_id"] for s in samples] == [
+            "HumanEval/0", "HumanEval/0", "HumanEval/0",
+            "HumanEval/1", "HumanEval/1", "HumanEval/1",
+        ]
+
+    def test_parallel_preserves_order_and_completes(self) -> None:
+        """Parallel generation finishes all pairs and keeps task-major output order."""
+        server = _FakeServer(delay=0.01)
+        task_ids = [f"HumanEval/{i}" for i in range(8)]
+        samples, wall_time, total_tokens = _generate_samples(
+            server, self._problems(task_ids), task_ids,
+            n_samples=2, temperature=0.0, max_tokens=100, parallel=4, seed=7,
+        )
+        assert [s["task_id"] for s in samples] == [t for t in task_ids for _ in range(2)]
+        assert len(server.calls) == 16
+        assert total_tokens == 16 * 7
+        # 8 tasks x 2 samples of 0.01s: parallel should beat serial
+        assert wall_time < 0.16
+
+    def test_parallel_reaches_requested_concurrency(self) -> None:
+        server = _FakeServer(delay=0.02)
+        task_ids = [f"HumanEval/{i}" for i in range(8)]
+        _generate_samples(
+            server, self._problems(task_ids), task_ids,
+            n_samples=1, temperature=0.0, max_tokens=100, parallel=4, seed=None,
+        )
+        assert server.max_concurrency >= 2  # actually overlapped
+
+    def test_parallel_seeded_calls(self) -> None:
+        server = _FakeServer()
+        _generate_samples(
+            server, self._problems(["HumanEval/0"]), ["HumanEval/0"],
+            n_samples=2, temperature=0.7, max_tokens=100, parallel=2, seed=123,
+        )
+        assert server.calls == [("HumanEval/0", 123), ("HumanEval/0", 123)]
+
+    def test_generation_error_propagates(self) -> None:
+        class _Boom(_FakeServer):
+            def generate(self, prompt, *, system, temperature, max_tokens, seed=None):
+                raise RuntimeError("server died")
+
+        with pytest.raises(RuntimeError, match="server died"):
+            _generate_samples(
+                _Boom(), self._problems(["HumanEval/0"]), ["HumanEval/0"],
+                n_samples=1, temperature=0.0, max_tokens=100, parallel=2, seed=None,
+            )

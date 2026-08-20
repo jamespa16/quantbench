@@ -6,16 +6,20 @@ import json
 import math
 import os
 import platform
+import threading
+import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from evalplus.data import get_human_eval_plus, write_jsonl
 from evalplus.eval import PASS
 from evalplus.evaluate import evaluate as evalplus_evaluate
 from evalplus.sanitize import script as evalplus_sanitize
 
-from quantbench.llama_server import LlamaServer
+from quantbench.llama_server import GenerateResult, LlamaServer
 
 _SYSTEM_PROMPT = (
     "You are an expert Python programmer. You will be given the start of a Python "
@@ -44,7 +48,15 @@ class EvalResult:
     n_problems: int
     pass_at_k: dict[int, float] | None = None
     pass_at_k_stats: dict[int, PassAtKStats] | None = None
-    pass_at_k_per_task: dict[int, list[float]] | None = None
+    # k -> {task_id -> pass@k score for that task}. Keyed by task id (not a
+    # bare list) so different quants can be compared on the *common* tasks
+    # even when sanitize drops a task for one of them.
+    pass_at_k_per_task: dict[int, dict[str, float]] | None = None
+    # Aggregate generation throughput (total tokens / wall time) and total
+    # wall time of the generation phase. With --parallel > 1 this is
+    # aggregate throughput across concurrent requests, not per-stream speed.
+    avg_tok_s: float | None = None
+    wall_time_s: float | None = None
 
 
 def _pass_at_k(n: int, c: int, k: int) -> float:
@@ -58,6 +70,89 @@ def _pass_at_k(n: int, c: int, k: int) -> float:
         return 1.0
 
 
+class _GeneratesCompletions(Protocol):
+    """Structural server type for generation, so tests can pass fakes
+    without constructing a LlamaServer (which spawns a real process)."""
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        system: str | None,
+        max_tokens: int,
+        temperature: float,
+        seed: int | None,
+    ) -> GenerateResult: ...
+
+
+def _generate_samples(
+    server: _GeneratesCompletions,
+    problems: dict,
+    tested_task_ids: list[str],
+    *,
+    n_samples: int,
+    temperature: float,
+    max_tokens: int,
+    parallel: int,
+    seed: int | None,
+    on_problem_done: Callable[[int, int, int, float], None] | None = None,
+) -> tuple[list[dict], float, int]:
+    """Generate every (task, sample) pair, optionally in parallel.
+
+    Returns (samples in task-major order, wall_time_s, total_completion_tokens).
+    `on_problem_done(completed, total, task_tokens, task_time)` fires when all
+    of a task's samples are done; `completed` is the count of problems finished
+    so far (not the problem's position), so it is monotonic even when problems
+    finish out of order under parallelism.
+    """
+    task_tokens: dict[str, int] = dict.fromkeys(tested_task_ids, 0)
+    task_time: dict[str, float] = dict.fromkeys(tested_task_ids, 0.0)
+    pending: dict[str, int] = dict.fromkeys(tested_task_ids, n_samples)
+    results: dict[tuple[str, int], dict] = {}
+    total_tokens = 0
+    completed = 0
+    lock = threading.Lock()  # only contended when parallel > 1
+
+    def work(task_id: str, sample_idx: int) -> None:
+        nonlocal total_tokens, completed
+        result = server.generate(
+            problems[task_id]["prompt"],
+            system=_SYSTEM_PROMPT,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            seed=seed,
+        )
+        results[(task_id, sample_idx)] = {"task_id": task_id, "solution": result.text}
+        with lock:
+            task_tokens[task_id] += result.completion_tokens
+            task_time[task_id] += result.elapsed_s
+            total_tokens += result.completion_tokens
+            pending[task_id] -= 1
+            if pending[task_id] == 0:
+                completed += 1
+                if on_problem_done is not None:
+                    on_problem_done(completed, len(tested_task_ids), task_tokens[task_id], task_time[task_id])
+
+    start = time.monotonic()
+    if parallel <= 1:
+        for task_id in tested_task_ids:
+            for s in range(n_samples):
+                work(task_id, s)
+    else:
+        with ThreadPoolExecutor(max_workers=parallel) as pool:
+            futures = [
+                pool.submit(work, task_id, s)
+                for task_id in tested_task_ids
+                for s in range(n_samples)
+            ]
+            for future in as_completed(futures):
+                future.result()  # propagate generation errors to the caller
+    wall_time = time.monotonic() - start
+
+    samples = [results[(tid, s)] for tid in tested_task_ids for s in range(n_samples)]
+    return samples, wall_time, total_tokens
+
+
 def run_humaneval_plus(
     server: LlamaServer,
     output_dir: Path,
@@ -68,6 +163,8 @@ def run_humaneval_plus(
     pass_at_k: list[int] | None = None,
     on_problem_done: Callable[[int, int, int, float], None] | None = None,
     max_tokens: int = 32000,
+    parallel: int = 1,
+    seed: int | None = None,
 ) -> EvalResult:
     if platform.system() == "Darwin":
         # macOS's setrlimit(RLIMIT_AS, ...) can't actually lower the address-space
@@ -82,22 +179,17 @@ def run_humaneval_plus(
     tested_task_ids = all_task_ids[:limit] if limit else all_task_ids
     skipped_task_ids = all_task_ids[limit:] if limit else []
 
-    samples = []
-    for i, task_id in enumerate(tested_task_ids, start=1):
-        task_total_tokens = 0
-        task_total_time = 0.0
-        for _s in range(n_samples):
-            result = server.generate(
-                problems[task_id]["prompt"],
-                system=_SYSTEM_PROMPT,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            samples.append({"task_id": task_id, "solution": result.text})
-            task_total_tokens += result.completion_tokens
-            task_total_time += result.elapsed_s
-        if on_problem_done:
-            on_problem_done(i, len(tested_task_ids), task_total_tokens, task_total_time)
+    samples, wall_time, total_tokens = _generate_samples(
+        server,
+        problems,
+        tested_task_ids,
+        n_samples=n_samples,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        parallel=parallel,
+        seed=seed,
+        on_problem_done=on_problem_done,
+    )
     samples += [
         {"task_id": task_id, "solution": problems[task_id]["prompt"] + _STUB_SUFFIX}
         for task_id in skipped_task_ids
@@ -139,22 +231,23 @@ def run_humaneval_plus(
     # Compute pass@k (extra/tests+ suite) with per-task scores + stats.
     pass_at_k_map: dict[int, float] | None = None
     pass_at_k_stats_map: dict[int, PassAtKStats] | None = None
-    pass_at_k_per_task_map: dict[int, list[float]] | None = None
+    pass_at_k_per_task_map: dict[int, dict[str, float]] | None = None
     if pass_at_k:
         pass_at_k_map = {}
         pass_at_k_stats_map = {}
         pass_at_k_per_task_map = {}
         for k in pass_at_k:
-            per_task: list[float] = []
+            per_task: dict[str, float] = {}
             for task_id in task_extra_correct:
-                n = task_n_samples[task_id]
-                c = task_extra_correct[task_id]
-                per_task.append(_pass_at_k(n, c, k))
+                per_task[task_id] = _pass_at_k(
+                    task_n_samples[task_id], task_extra_correct[task_id], k
+                )
             pass_at_k_per_task_map[k] = per_task
-            mean_val = sum(per_task) / len(per_task) if per_task else 0.0
-            n_tasks = len(per_task)
+            scores = list(per_task.values())
+            mean_val = sum(scores) / len(scores) if scores else 0.0
+            n_tasks = len(scores)
             if n_tasks >= 2:
-                variance = sum((s - mean_val) ** 2 for s in per_task) / (n_tasks - 1)
+                variance = sum((s - mean_val) ** 2 for s in scores) / (n_tasks - 1)
                 std_dev = math.sqrt(variance)
             else:
                 std_dev = 0.0
@@ -169,4 +262,6 @@ def run_humaneval_plus(
         pass_at_k=pass_at_k_map,
         pass_at_k_stats=pass_at_k_stats_map,
         pass_at_k_per_task=pass_at_k_per_task_map,
+        avg_tok_s=total_tokens / wall_time if wall_time > 0 else 0.0,
+        wall_time_s=wall_time,
     )

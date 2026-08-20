@@ -1,4 +1,9 @@
-"""CSV + bar chart output for a completed quantbench run."""
+"""CSV + bar chart output for a completed quantbench run.
+
+matplotlib and scipy are imported lazily (inside the functions that need
+them) so cheap CLI paths like --list-quants and --version don't pay the
+import cost.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +11,6 @@ import csv
 import textwrap
 from itertools import combinations
 from pathlib import Path
-
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from scipy import stats
 
 from quantbench.eval_runner import PassAtKStats
 from quantbench.orchestrator import QuantOutcome
@@ -30,15 +29,39 @@ _BAR = "#2a78d6"
 def _pairwise_p_values(
     outcomes: list[QuantOutcome], k: int
 ) -> dict[tuple[str, str], float]:
-    """Compute Welch's t-test p-values for all pairs of scored quants at a given k."""
-    scored = [(o.quant_name, o.result.pass_at_k_per_task[k])
+    """Paired t-test p-values for all pairs of scored quants at a given k.
+
+    Per-task scores are keyed by task id, so each pair is compared on the
+    tasks both quants actually scored (the paired test is both correctly
+    aligned and more powerful than an independent test on the same data).
+    Pairs with fewer than 2 common tasks get nan. A pair whose per-task
+    difference is constant is degenerate for the t-test (zero variance of
+    the differences) and is resolved analytically: no difference at all ->
+    p = 1.0, a perfectly consistent offset -> p = 0.0.
+    """
+    from scipy import stats
+
+    scored = {o.quant_name: o.result.pass_at_k_per_task[k]
               for o in outcomes
               if o.result and o.result.pass_at_k_per_task and k in o.result.pass_at_k_per_task
-              and len(o.result.pass_at_k_per_task[k]) >= 2]
+              and len(o.result.pass_at_k_per_task[k]) >= 2}
     p_map: dict[tuple[str, str], float] = {}
-    for (a, scores_a), (b, scores_b) in combinations(scored, 2):
-        _t_stat, p_val = stats.ttest_ind(scores_a, scores_b, equal_var=False)
-        p_map[(a, b)] = p_val
+    for (a, scores_a), (b, scores_b) in combinations(scored.items(), 2):
+        common = sorted(set(scores_a) & set(scores_b))
+        if len(common) < 2:
+            p_map[(a, b)] = float("nan")
+            continue
+        sa = [scores_a[t] for t in common]
+        sb = [scores_b[t] for t in common]
+        diffs = [x - y for x, y in zip(sa, sb, strict=True)]
+        if max(diffs) - min(diffs) < 1e-12:
+            # Constant offset: the t-test's denominator is exactly zero. scipy
+            # would return nan (with a catastrophic-cancellation warning), so
+            # resolve it analytically instead.
+            p_map[(a, b)] = 1.0 if abs(diffs[0]) < 1e-12 else 0.0
+        else:
+            _t_stat, p_val = stats.ttest_rel(sa, sb)
+            p_map[(a, b)] = float(p_val)
     return p_map
 
 
@@ -74,7 +97,10 @@ def write_csv(outcomes: list[QuantOutcome], path: Path) -> None:
 
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        header = ["quant", "base_pass1", "extra_pass1", "n_problems", "size_gb", "error"]
+        header = [
+            "quant", "base_pass1", "extra_pass1", "n_problems", "size_gb",
+            "avg_tok_s", "wall_time_s", "error",
+        ]
         for k in all_k:
             header += [f"pass@{k}", f"pass@{k}_std", f"pass@{k}_stderr"]
         if has_stats:
@@ -89,6 +115,8 @@ def write_csv(outcomes: list[QuantOutcome], path: Path) -> None:
                 f"{result.extra_pass1:.4f}" if result else "",
                 result.n_problems if result else "",
                 f"{o.size_bytes / 1e9:.3f}",
+                f"{result.avg_tok_s:.2f}" if result and result.avg_tok_s is not None else "",
+                f"{result.wall_time_s:.1f}" if result and result.wall_time_s is not None else "",
                 o.error or "",
             ]
             for k in all_k:
@@ -139,6 +167,13 @@ def write_chart(outcomes: list[QuantOutcome], path: Path, *, repo_id: str) -> No
     p_map: dict[tuple[str, str], float] = {}
     best_name: str | None = None
     sig_markers: list[str] = []
+
+    # Imported here (and in _pairwise_p_values) to keep the module import
+    # cheap for CLI paths that never render a chart.
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
     if has_pass_at_k:
         all_k = sorted({
@@ -213,7 +248,6 @@ def write_chart(outcomes: list[QuantOutcome], path: Path, *, repo_id: str) -> No
         width=0.6,
         zorder=3,
         ecolor=_INK_MUTED,
-        errhatches=None,
     )
 
     ax.set_ylim(0, min(1.05, max(values) + 0.1 * max(values) + 0.05))

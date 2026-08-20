@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,17 +31,15 @@ def repo_id() -> str:
 def mock_hf_api(request: pytest.FixtureRequest) -> MagicMock:
     """Return a mocked HfApi instance.
 
-    Set ``list_repo_files`` via ``mock_hf_api.list_repo_files.return_value``
-    or ``repo_info`` via ``mock_hf_api.repo_info.return_value``.
+    Configure the response via ``mock_hf_api.repo_info.return_value = ModelInfo(...)``
+    (discovery goes through ``repo_info(..., files_metadata=True)``).
     Use with ``patch("quantbench.<module>.HfApi", return_value=mock_hf_api)``.
     """
-    mock = MagicMock()
-    mock.list_repo_files.return_value = []
-    return mock
+    return MagicMock()
 
 
 @pytest.fixture()
-def patched_hf_api(mock_hf_api: MagicMock) -> MagicMock:
+def patched_hf_api(mock_hf_api: MagicMock) -> Iterator[MagicMock]:
     """Patch ``HfApi`` in ``quantbench.discovery`` with a mock instance.
 
     Yields the mock so tests can configure ``.return_value`` before use.
@@ -103,7 +102,10 @@ def sample_pass_at_k_stats() -> PassAtKStats:
 @pytest.fixture()
 def sample_eval_result() -> EvalResult:
     """An EvalResult without pass@k data."""
-    return EvalResult(base_pass1=0.5, extra_pass1=0.4, n_problems=100)
+    return EvalResult(
+        base_pass1=0.5, extra_pass1=0.4, n_problems=100,
+        avg_tok_s=50.0, wall_time_s=60.0,
+    )
 
 
 @pytest.fixture()
@@ -115,7 +117,17 @@ def sample_eval_result_with_pass_at_k() -> EvalResult:
         n_problems=100,
         pass_at_k={1: 0.70},
         pass_at_k_stats={1: PassAtKStats(mean=0.70, std_dev=0.1, std_error=0.02)},
-        pass_at_k_per_task={1: [0.8, 0.7, 0.6, 0.7, 0.7]},
+        pass_at_k_per_task={
+            1: {
+                "HumanEval/0": 0.8,
+                "HumanEval/1": 0.7,
+                "HumanEval/2": 0.6,
+                "HumanEval/3": 0.7,
+                "HumanEval/4": 0.7,
+            }
+        },
+        avg_tok_s=50.0,
+        wall_time_s=60.0,
     )
 
 
@@ -154,7 +166,7 @@ def sample_quant_outcomes() -> list[QuantOutcome]:
             n_problems=100,
             pass_at_k={1: 0.70},
             pass_at_k_stats={1: PassAtKStats(mean=0.70, std_dev=0.1, std_error=0.02)},
-            pass_at_k_per_task={1: [0.8, 0.7, 0.6, 0.7, 0.7]},
+            pass_at_k_per_task={1: {f"HumanEval/{i}": s for i, s in enumerate([0.8, 0.7, 0.6, 0.7, 0.7])}},
         ),
     )
     q8 = QuantOutcome(
@@ -166,7 +178,7 @@ def sample_quant_outcomes() -> list[QuantOutcome]:
             n_problems=100,
             pass_at_k={1: 0.60},
             pass_at_k_stats={1: PassAtKStats(mean=0.60, std_dev=0.12, std_error=0.025)},
-            pass_at_k_per_task={1: [0.7, 0.6, 0.5, 0.6, 0.6]},
+            pass_at_k_per_task={1: {f"HumanEval/{i}": s for i, s in enumerate([0.7, 0.6, 0.5, 0.6, 0.6])}},
         ),
     )
     q2 = QuantOutcome(
@@ -178,7 +190,7 @@ def sample_quant_outcomes() -> list[QuantOutcome]:
             n_problems=100,
             pass_at_k={1: 0.40},
             pass_at_k_stats={1: PassAtKStats(mean=0.40, std_dev=0.15, std_error=0.03)},
-            pass_at_k_per_task={1: [0.5, 0.4, 0.3, 0.4, 0.4]},
+            pass_at_k_per_task={1: {f"HumanEval/{i}": s for i, s in enumerate([0.5, 0.4, 0.3, 0.4, 0.4])}},
         ),
     )
     return [q4, q8, q2]

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import csv
 import math
+import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock
+
+import pytest
 
 from quantbench.eval_runner import EvalResult, PassAtKStats
 from quantbench.orchestrator import QuantOutcome
@@ -24,8 +27,10 @@ def _make_outcome(
     n_problems: int = 100,
     pass_at_k: dict[int, float] | None = None,
     pass_at_k_stats: dict[int, PassAtKStats] | None = None,
-    pass_at_k_per_task: dict[int, list[float]] | None = None,
+    pass_at_k_per_task: dict[int, dict[str, float]] | None = None,
     error: str | None = None,
+    avg_tok_s: float | None = None,
+    wall_time_s: float | None = None,
 ) -> QuantOutcome:
     """Build a QuantOutcome with the given parameters."""
     result = EvalResult(
@@ -35,6 +40,8 @@ def _make_outcome(
         pass_at_k=pass_at_k,
         pass_at_k_stats=pass_at_k_stats,
         pass_at_k_per_task=pass_at_k_per_task,
+        avg_tok_s=avg_tok_s,
+        wall_time_s=wall_time_s,
     )
     return QuantOutcome(quant_name, size_bytes, result, error=error)
 
@@ -50,7 +57,7 @@ def _make_outcomes_with_stats() -> list[QuantOutcome]:
         n_problems=100,
         pass_at_k={1: 0.70},
         pass_at_k_stats={1: PassAtKStats(mean=0.70, std_dev=0.1, std_error=0.02)},
-        pass_at_k_per_task={1: [0.8, 0.7, 0.6, 0.7, 0.7]},
+        pass_at_k_per_task={1: {f"HumanEval/{i}": s for i, s in enumerate([0.8, 0.7, 0.6, 0.7, 0.7])}},
     )
     # Q8_0 — second (0.60 mean)
     q8 = _make_outcome(
@@ -61,7 +68,7 @@ def _make_outcomes_with_stats() -> list[QuantOutcome]:
         n_problems=100,
         pass_at_k={1: 0.60},
         pass_at_k_stats={1: PassAtKStats(mean=0.60, std_dev=0.12, std_error=0.025)},
-        pass_at_k_per_task={1: [0.7, 0.6, 0.5, 0.6, 0.6]},
+        pass_at_k_per_task={1: {f"HumanEval/{i}": s for i, s in enumerate([0.7, 0.6, 0.5, 0.6, 0.6])}},
     )
     # Q2_K — worst (0.40 mean)
     q2 = _make_outcome(
@@ -72,7 +79,7 @@ def _make_outcomes_with_stats() -> list[QuantOutcome]:
         n_problems=100,
         pass_at_k={1: 0.40},
         pass_at_k_stats={1: PassAtKStats(mean=0.40, std_dev=0.15, std_error=0.03)},
-        pass_at_k_per_task={1: [0.5, 0.4, 0.3, 0.4, 0.4]},
+        pass_at_k_per_task={1: {f"HumanEval/{i}": s for i, s in enumerate([0.5, 0.4, 0.3, 0.4, 0.4])}},
     )
     return [q4, q8, q2]
 
@@ -195,7 +202,7 @@ class TestPairwisePValues:
                 "Q4_K_M", 4_000_000_000,
                 pass_at_k={1: 0.7},
                 pass_at_k_stats={1: PassAtKStats(mean=0.7, std_dev=0.1, std_error=0.02)},
-                pass_at_k_per_task={1: [0.7]},  # only 1 score
+                pass_at_k_per_task={1: {"HumanEval/0": 0.7}},  # only 1 score
             ),
         ]
         result = _pairwise_p_values(outcomes, 1)
@@ -208,29 +215,99 @@ class TestPairwisePValues:
         for p in result.values():
             assert 0.0 <= p <= 1.0
 
-    def test_identical_scores_high_p(self) -> None:
-        """Identical score distributions should yield p close to 1.0."""
-        shared_scores = [0.5, 0.5, 0.5, 0.5, 0.5]
+    def test_identical_scores_p_one(self) -> None:
+        """Identical per-task scores yield p = 1.0 (no evidence of a difference),
+        not the NaN that a degenerate t-test would produce."""
+        shared = {f"HumanEval/{i}": 0.5 for i in range(5)}
         outcomes = [
             _make_outcome(
                 "A", 4_000_000_000,
                 pass_at_k={1: 0.5},
                 pass_at_k_stats={1: PassAtKStats(mean=0.5, std_dev=0.0, std_error=0.0)},
-                pass_at_k_per_task={1: list(shared_scores)},
+                pass_at_k_per_task={1: dict(shared)},
             ),
             _make_outcome(
                 "B", 4_000_000_000,
                 pass_at_k={1: 0.5},
                 pass_at_k_stats={1: PassAtKStats(mean=0.5, std_dev=0.0, std_error=0.0)},
-                pass_at_k_per_task={1: list(shared_scores)},
+                pass_at_k_per_task={1: dict(shared)},
             ),
         ]
         result = _pairwise_p_values(outcomes, 1)
         assert len(result) == 1
-        # With identical data, the t-test p-value should be very high (close to 1.0)
-        # Note: with zero variance, scipy may return NaN, so we just check it's valid
         p = next(iter(result.values()))
-        assert math.isfinite(p) or math.isnan(p)
+        assert p == 1.0
+
+    def test_constant_offset_p_zero(self) -> None:
+        """A uniform per-task offset has zero difference variance: maximally
+        significant (p = 0.0), without scipy's degenerate-test warning."""
+        a = {f"HumanEval/{i}": s for i, s in enumerate([0.8, 0.7, 0.6, 0.7, 0.7])}
+        b = {t: v - 0.1 for t, v in a.items()}
+        outcomes = [
+            _make_outcome(
+                "A", 4_000_000_000,
+                pass_at_k={1: 0.7},
+                pass_at_k_stats={1: PassAtKStats(mean=0.7, std_dev=0.1, std_error=0.02)},
+                pass_at_k_per_task={1: a},
+            ),
+            _make_outcome(
+                "B", 4_000_000_000,
+                pass_at_k={1: 0.6},
+                pass_at_k_stats={1: PassAtKStats(mean=0.6, std_dev=0.1, std_error=0.02)},
+                pass_at_k_per_task={1: b},
+            ),
+        ]
+        result = _pairwise_p_values(outcomes, 1)
+        assert next(iter(result.values())) == 0.0
+
+    def test_paired_on_common_tasks_only(self) -> None:
+        """Pairs are compared on the tasks both quants scored.
+
+        If one quant has a task dropped by sanitize, the other quant's extra
+        task must not shift the alignment: the test runs on the intersection.
+        """
+        # B is missing HumanEval/2 (dropped by sanitize for B only).
+        a = {f"HumanEval/{i}": s for i, s in enumerate([0.8, 0.7, 0.6, 0.7, 0.7])}
+        b = {k: v for k, v in a.items() if k != "HumanEval/2"}
+        b = {k: max(0.0, v - 0.1) for k, v in b.items()}  # B is consistently worse
+        outcomes = [
+            _make_outcome(
+                "A", 4_000_000_000,
+                pass_at_k={1: 0.7},
+                pass_at_k_stats={1: PassAtKStats(mean=0.7, std_dev=0.1, std_error=0.02)},
+                pass_at_k_per_task={1: a},
+            ),
+            _make_outcome(
+                "B", 4_000_000_000,
+                pass_at_k={1: 0.6},
+                pass_at_k_stats={1: PassAtKStats(mean=0.6, std_dev=0.1, std_error=0.02)},
+                pass_at_k_per_task={1: b},
+            ),
+        ]
+        result = _pairwise_p_values(outcomes, 1)
+        assert len(result) == 1
+        p = next(iter(result.values()))
+        assert 0.0 <= p <= 1.0
+
+    def test_fewer_than_two_common_tasks_is_nan(self) -> None:
+        """Pairs sharing fewer than 2 tasks can't be tested and get nan."""
+        outcomes = [
+            _make_outcome(
+                "A", 4_000_000_000,
+                pass_at_k={1: 0.7},
+                pass_at_k_stats={1: PassAtKStats(mean=0.7, std_dev=0.1, std_error=0.02)},
+                pass_at_k_per_task={1: {"HumanEval/0": 0.8, "HumanEval/1": 0.6}},
+            ),
+            _make_outcome(
+                "B", 4_000_000_000,
+                pass_at_k={1: 0.6},
+                pass_at_k_stats={1: PassAtKStats(mean=0.6, std_dev=0.1, std_error=0.02)},
+                pass_at_k_per_task={1: {"HumanEval/0": 0.7, "HumanEval/2": 0.5}},  # only 1 common
+            ),
+        ]
+        result = _pairwise_p_values(outcomes, 1)
+        p = next(iter(result.values()))
+        assert math.isnan(p)
 
     def test_k_mismatch_filters_outcome(self) -> None:
         """Outcomes that don't have data for the requested k are filtered."""
@@ -239,7 +316,7 @@ class TestPairwisePValues:
                 "Q4_K_M", 4_000_000_000,
                 pass_at_k={5: 0.7},  # only has k=5
                 pass_at_k_stats={5: PassAtKStats(mean=0.7, std_dev=0.1, std_error=0.02)},
-                pass_at_k_per_task={5: [0.8, 0.7, 0.6, 0.7, 0.7]},
+                pass_at_k_per_task={5: {f"HumanEval/{i}": s for i, s in enumerate([0.8, 0.7, 0.6, 0.7, 0.7])}},
             ),
         ]
         result = _pairwise_p_values(outcomes, 1)  # asking for k=1
@@ -330,9 +407,9 @@ class TestWriteCsvHeader:
                     10: PassAtKStats(mean=0.65, std_dev=0.11, std_error=0.023),
                 },
                 pass_at_k_per_task={
-                    1: [0.8, 0.7, 0.6, 0.7, 0.7],
-                    5: [0.7, 0.6, 0.5, 0.6, 0.6],
-                    10: [0.7, 0.65, 0.6, 0.65, 0.65],
+                    1: {f"HumanEval/{i}": v for i, v in enumerate([0.8, 0.7, 0.6, 0.7, 0.7])},
+                    5: {f"HumanEval/{i}": v for i, v in enumerate([0.7, 0.6, 0.5, 0.6, 0.6])},
+                    10: {f"HumanEval/{i}": v for i, v in enumerate([0.7, 0.65, 0.6, 0.65, 0.65])},
                 },
             )
         ]
@@ -516,44 +593,59 @@ class TestWriteCsvPValueColumn:
 # ---------------------------------------------------------------------------
 
 
+_ABSENT = object()
+
+
+@pytest.fixture()
+def plt_mocks():
+    """Make `import matplotlib.pyplot as plt` inside write_chart resolve to a mock.
+
+    Both lookup paths are covered: the sys.modules entry *and* the attribute on
+    the matplotlib package (IMPORT_FROM checks the attribute first). Only the
+    single key is touched, so unrelated modules imported during the test (e.g.
+    scipy's C extensions) are left alone.
+    """
+    import matplotlib
+
+    mock_plt = MagicMock()
+    mock_fig, mock_ax = MagicMock(), MagicMock()
+    mock_plt.subplots.return_value = (mock_fig, mock_ax)
+    saved_mod = sys.modules.get("matplotlib.pyplot", _ABSENT)
+    saved_attr = getattr(matplotlib, "pyplot", _ABSENT)
+    sys.modules["matplotlib.pyplot"] = mock_plt
+    matplotlib.pyplot = mock_plt
+    try:
+        yield mock_plt, mock_ax
+    finally:
+        if saved_mod is _ABSENT:
+            del sys.modules["matplotlib.pyplot"]
+        else:
+            sys.modules["matplotlib.pyplot"] = saved_mod
+        if saved_attr is _ABSENT:
+            delattr(matplotlib, "pyplot")
+        else:
+            matplotlib.pyplot = saved_attr
+
+
 class TestWriteChart:
     """Test write_chart with QuantOutcome data."""
 
-    def test_chart_with_pass_at_k(self, tmp_path: Path) -> None:
+    def test_chart_with_pass_at_k(self, tmp_path: Path, plt_mocks) -> None:
         """Chart is generated when pass@k data is present."""
-        outcomes = _make_outcomes_with_stats()
-        path = tmp_path / "report.png"
-        with patch("quantbench.report.plt") as mock_plt:
-            mock_ax = mock_plt.subplots.return_value.__enter__.return_value
-            mock_ax.bar.return_value = None
-            mock_fig = mock_plt.subplots.return_value.__enter__
-            mock_plt.subplots.return_value = (mock_fig, mock_ax)
-            write_chart(outcomes, path, repo_id="author/model")
-        # With full mock, savefig is called
+        mock_plt, _ = plt_mocks
+        write_chart(_make_outcomes_with_stats(), tmp_path / "report.png", repo_id="author/model")
         mock_plt.close.assert_called_once()
 
-    def test_chart_without_pass_at_k(self, tmp_path: Path) -> None:
+    def test_chart_without_pass_at_k(self, tmp_path: Path, plt_mocks) -> None:
         """Chart falls back to extra_pass1 when no pass@k data."""
-        outcomes = _make_outcomes_no_pass_at_k()
-        path = tmp_path / "report.png"
-        with patch("quantbench.report.plt") as mock_plt:
-            mock_ax = mock_plt.subplots.return_value.__enter__.return_value
-            mock_ax.bar.return_value = None
-            mock_fig = mock_plt.subplots.return_value.__enter__
-            mock_plt.subplots.return_value = (mock_fig, mock_ax)
-            write_chart(outcomes, path, repo_id="author/model")
+        mock_plt, _ = plt_mocks
+        write_chart(_make_outcomes_no_pass_at_k(), tmp_path / "report.png", repo_id="author/model")
         mock_plt.close.assert_called_once()
 
-    def test_chart_single_outcome(self, tmp_path: Path) -> None:
+    def test_chart_single_outcome(self, tmp_path: Path, plt_mocks) -> None:
         """Chart works with a single outcome."""
-        outcomes = _make_outcomes_with_stats()[:1]
-        path = tmp_path / "report.png"
-        with patch("quantbench.report.plt") as mock_plt:
-            mock_ax = mock_plt.subplots.return_value.__enter__.return_value
-            mock_ax.bar.return_value = None
-            mock_fig = mock_plt.subplots.return_value.__enter__
-            mock_plt.subplots.return_value = (mock_fig, mock_ax)
-            write_chart(outcomes, path, repo_id="author/model")
+        mock_plt, _ = plt_mocks
+        write_chart(_make_outcomes_with_stats()[:1], tmp_path / "report.png", repo_id="author/model")
         mock_plt.close.assert_called_once()
 
     def test_chart_empty_outcomes(self, tmp_path: Path) -> None:
@@ -563,65 +655,57 @@ class TestWriteChart:
         # The function prints a warning and returns; no file is created
         assert not path.exists()
 
-    def test_chart_preserves_ordering(self, tmp_path: Path) -> None:
+    def test_chart_preserves_ordering(self, tmp_path: Path, plt_mocks) -> None:
         """Chart sorts bars from best to worst."""
-        outcomes = _make_outcomes_with_stats()
-        path = tmp_path / "report.png"
-        with patch("quantbench.report.plt") as mock_plt:
-            mock_ax = mock_plt.subplots.return_value.__enter__.return_value
-            mock_ax.bar.return_value = None
-            mock_fig = mock_plt.subplots.return_value.__enter__
-            mock_plt.subplots.return_value = (mock_fig, mock_ax)
-            write_chart(outcomes, path, repo_id="author/model")
+        _, mock_ax = plt_mocks
+        write_chart(_make_outcomes_with_stats(), tmp_path / "report.png", repo_id="author/model")
         # Check bar was called (i.e., chart was constructed)
         mock_ax.bar.assert_called_once()
 
-    def test_chart_with_failed_outcomes(self, tmp_path: Path) -> None:
+    def test_chart_with_failed_outcomes(self, tmp_path: Path, plt_mocks) -> None:
         """Chart handles mixed success/failure outcomes."""
+        mock_plt, _ = plt_mocks
         outcomes = [
             _make_outcome(
                 "Q4_K_M", 4_000_000_000,
                 pass_at_k={1: 0.70},
                 pass_at_k_stats={1: PassAtKStats(mean=0.70, std_dev=0.1, std_error=0.02)},
-                pass_at_k_per_task={1: [0.8, 0.7, 0.6, 0.7, 0.7]},
+                pass_at_k_per_task={1: {f"HumanEval/{i}": v for i, v in enumerate([0.8, 0.7, 0.6, 0.7, 0.7])}},
             ),
             # Failed outcome — no result
             QuantOutcome("Q2_K", 2_000_000_000, None, error="timeout"),
         ]
-        path = tmp_path / "report.png"
-        with patch("quantbench.report.plt") as mock_plt:
-            mock_ax = mock_plt.subplots.return_value.__enter__.return_value
-            mock_ax.bar.return_value = None
-            mock_fig = mock_plt.subplots.return_value.__enter__
-            mock_plt.subplots.return_value = (mock_fig, mock_ax)
-            write_chart(outcomes, path, repo_id="author/model")
+        write_chart(outcomes, tmp_path / "report.png", repo_id="author/model")
         mock_plt.close.assert_called_once()
 
-    def test_chart_overwrites_existing(self, tmp_path: Path) -> None:
-        """write_chart overwrites an existing file."""
+    def test_chart_overwrites_existing(self, tmp_path: Path, plt_mocks) -> None:
+        """write_chart overwrites an existing file (mocked: savefig is called)."""
+        mock_plt, _ = plt_mocks
         path = tmp_path / "report.png"
         path.write_bytes(b"old content")
-        outcomes = _make_outcomes_with_stats()[:1]
-        with patch("quantbench.report.plt") as mock_plt:
-            mock_ax = mock_plt.subplots.return_value.__enter__.return_value
-            mock_ax.bar.return_value = None
-            mock_fig = mock_plt.subplots.return_value.__enter__
-            mock_plt.subplots.return_value = (mock_fig, mock_ax)
-            mock_fig.savefig = mock_fig.savefig or (lambda *a, **k: None)
-            write_chart(outcomes, path, repo_id="author/model")
+        write_chart(_make_outcomes_with_stats()[:1], path, repo_id="author/model")
         mock_plt.close.assert_called_once()
+        mock_plt.subplots.return_value[0].savefig.assert_called_once()
 
-    def test_chart_repo_id_included(self, tmp_path: Path) -> None:
+    def test_chart_repo_id_included(self, tmp_path: Path, plt_mocks) -> None:
         """Chart is generated with the repo_id for the title."""
-        outcomes = _make_outcomes_with_stats()[:1]
+        _, mock_ax = plt_mocks
+        write_chart(_make_outcomes_with_stats()[:1], tmp_path / "report.png", repo_id="test/repo")
+        assert mock_ax.set_title.called
+
+
+class TestWriteChartReal:
+    """Render with real matplotlib (unmocked) to catch invalid kwarg bugs
+    that a fully mocked plt can't surface."""
+
+    def test_real_render_pass_at_k(self, tmp_path: Path) -> None:
         path = tmp_path / "report.png"
-        with patch("quantbench.report.plt") as mock_plt:
-            mock_ax = mock_plt.subplots.return_value.__enter__.return_value
-            mock_ax.bar.return_value = None
-            mock_fig = mock_plt.subplots.return_value.__enter__
-            mock_plt.subplots.return_value = (mock_fig, mock_ax)
-            # Should not raise; repo_id is used in the chart title
-            write_chart(outcomes, path, repo_id="test/repo")
-            # Verify set_title was called with repo_id in it
-            title_call = mock_ax.set_title
-            assert title_call.called
+        write_chart(_make_outcomes_with_stats(), path, repo_id="author/model")
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+    def test_real_render_fallback(self, tmp_path: Path) -> None:
+        path = tmp_path / "report.png"
+        write_chart(_make_outcomes_no_pass_at_k(), path, repo_id="author/model")
+        assert path.exists()
+        assert path.stat().st_size > 0
